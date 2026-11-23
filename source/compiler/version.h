@@ -1,0 +1,5 @@
+#define VERSION_MINOR 11
+#define VERSION_MAJOR 3
+#define VERSION_BUILD 0
+#define VERSION_STR "3.11.0"
+#define VERSION_INT 779

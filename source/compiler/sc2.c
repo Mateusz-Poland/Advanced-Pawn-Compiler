@@ -21,6 +21,7 @@
  *  Version: $Id: sc2.c 3655 2006-10-23 20:17:52Z thiadmer $
  */
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,57 +131,186 @@ SC_FUNC void clearstk(void)
   assert(stktop==0);
 }
 
-SC_FUNC int plungequalifiedfile(char *name)
-{
-static char extensions[][6] = { "", ".inc", ".p", ".pawn" };
-  int found;
-  struct stat st;
-  FILE *fp;
-  char *path;
-  char *real_path;
-  char *ext;
-  int ext_idx;
+/* Qualified compatibility includes need a private key with the full path.
+ * The legacy _inc_ symbol remains available for short, unqualified names. */
+typedef struct include_guard {
+  struct include_guard *next;
+  char path[1];
+} include_guard;
 
-  fp=NULL;
-  ext_idx=0;
-  path=(char *)malloc(strlen(name)+sizeof(extensions[0]));
-  if (path==NULL)
-    error(103);                 /* insufficient memory */
-  strcpy(path,name);
-  real_path=(char *)malloc(strlen(name)+sizeof(extensions[0]));
-  if (real_path==NULL) {
-    free(path);
-    error(103);                 /* insufficient memory */
+static hashtable_t qualified_includes;
+static int qualified_includes_initialized;
+static uint32_t murmurhash2_aligned(const void *key,int len,uint32_t seed);
+
+SC_FUNC void clear_include_guards(void)
+{
+  if (qualified_includes_initialized) {
+    include_guard **items=(include_guard**)hashtable_items(&qualified_includes);
+    int i,count=hashtable_count(&qualified_includes);
+    for (i=0; i<count; i++) {
+      include_guard *entry=items[i];
+      while (entry!=NULL) {
+        include_guard *next=entry->next;
+        free(entry);
+        entry=next;
+      }
+    }
+    hashtable_term(&qualified_includes);
+    qualified_includes_initialized=FALSE;
   }
-  do {
-    found=TRUE;
-    ext=strchr(path,'\0');      /* save position */
-    strcpy(ext,extensions[ext_idx]);
-    strcpy(real_path,path);
+}
+
+static int remember_include(const char *path)
+{
+  include_guard **bucket,*entry;
+  size_t length=strlen(path);
+  HASHTABLE_U64 key=(HASHTABLE_U64)murmurhash2_aligned(path,(int)length,0);
+
+  if (!qualified_includes_initialized) {
+    hashtable_init(&qualified_includes,sizeof(include_guard*),64,NULL);
+    qualified_includes_initialized=TRUE;
+  }
+  bucket=(include_guard**)hashtable_find(&qualified_includes,key);
+  for (entry=bucket!=NULL ? *bucket : NULL; entry!=NULL; entry=entry->next)
+    if (strcmp(entry->path,path)==0)
+      return FALSE;
+  entry=(include_guard*)malloc(sizeof(*entry)+length);
+  if (entry==NULL)
+    return -1;
+  memcpy(entry->path,path,length+1);
+  entry->next=bucket!=NULL ? *bucket : NULL;
+  if (bucket!=NULL) {
+    *bucket=entry;
+  } else if (!hashtable_insert(&qualified_includes,key,&entry)) {
+    free(entry);
+    return -1;
+  }
+  return TRUE;
+}
+
+static int remember_resolved_include(const char *path)
+{
+  #if defined _WIN32
+    char absolute[_MAX_PATH+6];
+    if (_fullpath(absolute,path,sizeof absolute)!=NULL) {
+      char *p;
+      for (p=absolute; *p!='\0'; p++)
+        if (*p=='/')
+          *p='\\';
+      return remember_include(absolute);
+    }
+  #elif defined LINUX || defined __FreeBSD__ || defined __OpenBSD__
+    char *absolute=realpath(path,NULL);
+    if (absolute!=NULL) {
+      int result=remember_include(absolute);
+      free(absolute);
+      return result;
+    }
+  #endif
+  return remember_include(path);
+}
+
+/* Reuse resolutions within one compilation, including its later passes.
+ * The key includes every per-request input to search order. Changes to -D
+ * or the -i list invalidate the cache. File contents are always reopened. */
+#define INCLUDE_CACHE_SLOTS 4096
+typedef struct {
+  unsigned short name_length,parent_length;
+  unsigned char mode,found;
+  char text[1];  /* name, parent dir bytes, and optionally the resolved path */
+} include_result;
+
+static include_result *include_cache[INCLUDE_CACHE_SLOTS];
+static int include_cache_used;
+
+SC_FUNC void clear_include_cache(void)
+{
+  if (include_cache_used) {
+    size_t i;
+    for (i=0; i<INCLUDE_CACHE_SLOTS; i++)
+      free(include_cache[i]);
+    memset(include_cache,0,sizeof include_cache);
+    include_cache_used=FALSE;
+  }
+}
+
+static int enter_include(const char *name,int track_path,int exact,char *selected,int *cacheable)
+{
+  static const char extensions[][6]={ "", ".inc", ".p", ".pawn" };
+  char candidate[_MAX_PATH+sizeof extensions[0]];
+  #if DIRSEP_CHAR!='\\'
+    char normalized[sizeof candidate];
+    char *real_path=normalized;
+  #else
+    char *real_path=candidate;
+  #endif
+  size_t length=strlen(name);
+  unsigned int ext;
+  FILE *fp=NULL;
+  char *path;
+
+  if ((!exact && length>=_MAX_PATH) || length>=sizeof candidate)
+    return FALSE;
+  memcpy(candidate,name,length+1);
+  #if DIRSEP_CHAR!='\\'
+    {
+      size_t i;
+      for (i=0; i<length; i++)
+        real_path[i]=(pc_compat && name[i]=='\\') ? DIRSEP_CHAR : name[i];
+    }
+  #endif
+  for (ext=0; ext<(exact ? 1 : sizeof extensions/sizeof extensions[0]); ext++) {
+    PC_PROFILE_BEGIN(inc_probe);
+    strcpy(candidate+length,extensions[ext]);
     #if DIRSEP_CHAR!='\\'
-      if (pc_compat) {
-        char *ptr;
-        /* convert backslashes to native directory separators for maximum
-         * compatibility with the Windows compiler
-         */
-        for (ptr=real_path; *ptr!='\0'; ptr++)
-          if (*ptr=='\\')
-            *ptr=DIRSEP_CHAR;
+      strcpy(real_path+length,extensions[ext]);
+    #endif
+    #if !defined _WIN32
+      {
+        struct stat st;
+        if (stat(real_path,&st)!=0) {
+          if (cacheable!=NULL && errno!=ENOENT && errno!=ENOTDIR)
+            *cacheable=FALSE;
+          PC_PROFILE_END(inc_probe,0);
+          continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+          PC_PROFILE_END(inc_probe,0);
+          continue;
+        }
       }
     #endif
-    if (stat(real_path,&st)==0 && !S_ISDIR(st.st_mode))
-      fp=(FILE*)pc_opensrc(real_path);
-    if (fp==NULL) {
-      *ext='\0';                /* on failure, restore filename */
-      found=FALSE;
-    }
-    ext_idx++;
-  } while (!found && ext_idx<(sizeof extensions / sizeof extensions[0]));
-  if (!found) {
-    free(real_path);
-    free(path);
+    /* Windows fopen rejects directories, so the open also tests existence. */
+    fp=(FILE*)pc_opensrc(real_path);
+    if (fp==NULL && cacheable!=NULL && errno!=ENOENT && errno!=ENOTDIR)
+      *cacheable=FALSE;
+    PC_PROFILE_END(inc_probe,fp!=NULL);
+    if (fp!=NULL)
+      break;
+  }
+  if (fp==NULL)
     return FALSE;
-  } /* if */
+
+  if (selected!=NULL)
+    strcpy(selected,candidate);
+  if (track_path) {
+    int status=remember_resolved_include(real_path);
+    if (status<=0) {
+      pc_closesrc(fp);
+      if (status<0)
+        error(103);
+      return TRUE;
+    }
+  }
+  length=strlen(candidate)+1;
+  path=(char*)malloc(length);
+  if (path==NULL) {
+    pc_closesrc(fp);
+    error(103);
+    return FALSE;
+  }
+  memcpy(path,candidate,length);
+
   PUSHSTK_P(inpf);
   PUSHSTK_P(inpfname);          /* pointer to current file name */
   PUSHSTK_P(curlibrary);
@@ -204,53 +334,122 @@ static char extensions[][6] = { "", ".inc", ".p", ".pawn" };
   setfileconst(inpfname);
   listline=-1;              /* force a #line directive when changing the file */
   sc_is_utf8=(short)scan_utf8(inpf,real_path);
-  free(real_path);
   return TRUE;
 }
 
-SC_FUNC int plungefile(char *name,int try_currentpath,int try_includepaths)
+SC_FUNC int plungequalifiedfile(char *name)
+{
+  return enter_include(name,FALSE,FALSE,NULL,NULL);
+}
+
+static int find_and_enter_include(char *name,int try_currentpath,int try_includepaths,int track_path)
 {
   char dirsep=
     #if DIRSEP_CHAR!='\\'
-      /* use Windows directory separators in compatibility mode and
-       * native separators otherwise */
       pc_compat ? '\\' : DIRSEP_CHAR;
     #else
       DIRSEP_CHAR;
     #endif
-  int result=FALSE;
+  char selected[_MAX_PATH+6];
+  const char *parent=inpfname;
+  size_t length=strlen(name),parent_length=0,slot;
+  unsigned char mode=(try_currentpath ? 1 : 0) | (try_includepaths ? 2 : 0) | (pc_compat ? 4 : 0);
+  include_result *entry;
+  int result=FALSE,cacheable=TRUE;
+  PC_PROFILE_BEGIN(inc_search);
+  PC_PROFILE_BEGIN(inc_miss);
 
   if (try_currentpath) {
-    result=plungequalifiedfile(name);
-    if (!result) {
-      /* failed to open the file in the active directory, try to open the file
-       * in the same directory as the current file --but first check whether
-       * there is a (relative) path for the current file
-       */
-      char *ptr;
-      if ((ptr=strrchr(inpfname,dirsep))!=0) {
-        int len=(int)(ptr-inpfname)+1;
-        if (len+strlen(name)<_MAX_PATH) {
-          char path[_MAX_PATH];
-          strlcpy(path,inpfname,len+1);
-          strlcat(path,name,sizeof path);
-          result=plungequalifiedfile(path);
-        } /* if */
-      } /* if */
-    } /* if */
-  } /* if */
+    const char *end=strrchr(parent,dirsep);
+    if (pc_compat && dirsep!='/') {
+      const char *slash=strrchr(parent,'/');
+      if (slash!=NULL && (end==NULL || slash>end))
+        end=slash;
+    }
+    if (end!=NULL)
+      parent_length=(size_t)(end-parent)+1;
+  }
 
+  slot=murmurhash2_aligned(name,(int)length,
+                         parent_length ? murmurhash2_aligned(parent,(int)parent_length,mode) : mode)
+       & (INCLUDE_CACHE_SLOTS-1);
+  entry=include_cache[slot];
+  if (entry!=NULL && entry->mode==mode && entry->name_length==length
+      && entry->parent_length==parent_length && memcmp(entry->text,name,length)==0
+      && (parent_length==0 || memcmp(entry->text+length,parent,parent_length)==0)) {
+    PC_PROFILE_BEGIN(inc_cache);
+    if (entry->found) {
+      result=enter_include(entry->text+length+parent_length,track_path,TRUE,NULL,NULL);
+      if (result) {
+        PC_PROFILE_END(inc_cache,1);
+        PC_PROFILE_END(inc_search,1);
+        return TRUE;
+      }
+    } else {
+      PC_PROFILE_END(inc_cache,1);
+      PC_PROFILE_END(inc_miss,1);
+      PC_PROFILE_END(inc_search,1);
+      return FALSE;
+    }
+    PC_PROFILE_END(inc_cache,0);
+  }
+
+  if (try_currentpath) {
+    {
+      PC_PROFILE_BEGIN(inc_cwd);
+      result=enter_include(name,track_path,FALSE,selected,&cacheable);
+      PC_PROFILE_END(inc_cwd,result);
+    }
+    if (!result && parent_length>0 && parent_length+length<_MAX_PATH) {
+      char path[_MAX_PATH];
+      PC_PROFILE_BEGIN(inc_parent);
+      memcpy(path,parent,parent_length);
+      memcpy(path+parent_length,name,length+1);
+      result=enter_include(path,track_path,FALSE,selected,&cacheable);
+      PC_PROFILE_END(inc_parent,result);
+    }
+  }
   if (try_includepaths && name[0]!=dirsep) {
     int i;
     char *ptr;
     for (i=0; !result && (ptr=get_path(i))!=NULL; i++) {
       char path[_MAX_PATH];
+      PC_PROFILE_BEGIN(inc_path);
       strlcpy(path,ptr,sizeof path);
       strlcat(path,name,sizeof path);
-      result=plungequalifiedfile(path);
-    } /* while */
-  } /* if */
+      result=enter_include(path,track_path,FALSE,selected,&cacheable);
+      PC_PROFILE_END(inc_path,result);
+    }
+  }
+
+  free(include_cache[slot]);
+  include_cache[slot]=NULL;
+  if (cacheable && length<=USHRT_MAX && parent_length<=USHRT_MAX) {
+    size_t selected_length=result ? strlen(selected)+1 : 0;
+    entry=(include_result*)malloc(sizeof(*entry)+length+parent_length+selected_length);
+    if (entry!=NULL) {
+      entry->name_length=(unsigned short)length;
+      entry->parent_length=(unsigned short)parent_length;
+      entry->mode=mode;
+      entry->found=(unsigned char)result;
+      memcpy(entry->text,name,length);
+      if (parent_length!=0)
+        memcpy(entry->text+length,parent,parent_length);
+      if (selected_length!=0)
+        memcpy(entry->text+length+parent_length,selected,selected_length);
+      include_cache[slot]=entry;
+      include_cache_used=TRUE;
+    }
+  }
+  if (!result)
+    PC_PROFILE_END(inc_miss,1);
+  PC_PROFILE_END(inc_search,1);
   return result;
+}
+
+SC_FUNC int plungefile(char *name,int try_currentpath,int try_includepaths)
+{
+  return find_and_enter_include(name,try_currentpath,try_includepaths,FALSE);
 }
 
 static void check_empty(const unsigned char *lptr)
@@ -277,10 +476,9 @@ static void doinclude(int silent)
 {
   char name[_MAX_PATH];
   char symname[sNAMEMAX];
-  char *ptr;
   char c;
   int i, result;
-  int included=FALSE;
+  int included=FALSE,track_path=FALSE;
 
   while (*lptr<=' ' && *lptr!='\0')         /* skip leading whitespace */
     lptr++;
@@ -309,22 +507,14 @@ static void doinclude(int silent)
     check_empty(lptr+1);        /* verify that the rest of the line is whitespace */
 
   if (pc_compat) {
-    /* create a symbol from the name of the include file; this allows the system
-     * to test for multiple inclusions
-     */
-    char dirsep=
-      #if DIRSEP_CHAR!='\\'
-        '\\';
-      #else
-        DIRSEP_CHAR;
-      #endif
-    strcpy(symname,"_inc_");
-    if ((ptr=strrchr(name,dirsep))!=NULL)
-      strlcat(symname,ptr+1,sizeof symname);
-    else
-      strlcat(symname,name,sizeof symname);
-    included=find_symbol(&glbtab,symname,fcurrent,-1,NULL)!=NULL;
-  } /* if */
+    track_path=strchr(name,'/')!=NULL || strchr(name,'\\')!=NULL
+               || strchr(name,':')!=NULL || strlen(name)>sizeof symname-sizeof "_inc_";
+    if (!track_path) {
+      strcpy(symname,"_inc_");
+      strcat(symname,name);
+      included=find_symbol(&glbtab,symname,fcurrent,-1,NULL)!=NULL;
+    }
+  }
 
   if (!included) {
     /* constant is not present, so this file has not been included yet */
@@ -333,8 +523,8 @@ static void doinclude(int silent)
      * directory, or from a list of "include directories". Include files
      * between <...> are only read from the list of include directories.
      */
-    result=plungefile(name,(c!='>'),TRUE);
-    if (result && pc_compat)
+    result=find_and_enter_include(name,(c!='>'),TRUE,track_path);
+    if (result && pc_compat && !track_path)
       add_constant(symname,1,sGLOBAL,0);
     else if (!result && !silent)
       error(100,name);          /* cannot read from ... (fatal error) */
@@ -1252,9 +1442,13 @@ static int command(void)
             sc_tabsize=(int)val;
         } else if (strcmp(str,"align")==0) {
           sc_alignnext=TRUE;
-        } else if (strcmp(str,"unused")==0) {
+        } else if (strcmp(str,"unused")==0 || strcmp(str,"unread")==0
+                   || strcmp(str,"unwritten")==0 || strcmp(str,"nodestruct")==0) {
           char name[sNAMEMAX+1];
           int i,comma;
+          int nodestruct=str[0]=='n';
+          int read=(!nodestruct && str[2]!='w') ? uREAD : 0;
+          int write=(!nodestruct && str[2]!='r') ? uWRITTEN : 0;
           symbol *sym;
           do {
             /* get the name */
@@ -1272,10 +1466,10 @@ static int command(void)
             if (sym==NULL)
               sym=findglb(name,sSTATEVAR);
             if (sym!=NULL) {
-              sym->usage |= uREAD;
+              sym->usage |= nodestruct ? uNODESTRUCT : read;
               if (sym->ident==iVARIABLE || sym->ident==iREFERENCE
                   || sym->ident==iARRAY || sym->ident==iREFARRAY)
-                sym->usage |= uWRITTEN;
+                sym->usage |= write;
             } else {
               error(17,name);     /* undefined symbol */
             } /* if */
@@ -1562,15 +1756,13 @@ static int command(void)
   case tpWARNING:
     while (*lptr<=' ' && *lptr!='\0')
       lptr++;
-    while (*lptr<=' ' && *lptr!='\0')
-      lptr++;
     if (!SKIPPING) {
       char *usermsg=strdupwithouta((const char *)lptr);
       if (usermsg!=NULL) {
-        char *ptr=usermsg+strlen(usermsg)-1;
-        /* remove trailing whitespace and newlines */
-        while (*ptr<=' ')
-          *ptr--='\0';
+        size_t length=strlen(usermsg);
+        while (length>0 && (unsigned char)usermsg[length-1]<=' ')
+          length--;
+        usermsg[length]='\0';
         if (tok==tpERROR)
           error(111,usermsg); /* user error */
         else
@@ -1582,8 +1774,11 @@ static int command(void)
     } /* if */
     break;
   default:
-    error(31);          /* unknown compiler directive */
-    ret=SKIPPING ? CMD_CONDFALSE : CMD_NONE;  /* process as normal line */
+    if (!SKIPPING) {
+      error(31);          /* unknown compiler directive */
+      ret=CMD_NONE;  /* process as normal line */
+    }
+    litidx=0;       /* lexing an unknown directive can queue a string literal */
   } /* switch */
   return ret;
 }
@@ -1940,7 +2135,7 @@ SC_FUNC void preprocess(void)
         lptr=pline;       /* reset "line pointer" to start of the parsing buffer */
       } /* if */
     #endif
-    if (sc_status==statFIRST && sc_listing && freading
+    if (sc_status==statSECOND && freading
         && (iscommand==CMD_NONE || iscommand==CMD_EMPTYLINE || iscommand==CMD_DIRECTIVE))
     {
       listline++;
@@ -2171,7 +2366,7 @@ char *sc_tokens[] = {
          "defined", "do", "else", "emit", "__emit", "*end", "enum", "exit", "for",
          "forward", "goto", "if", "native", "new", "operator", "public", "return",
          "sizeof", "sleep", "state", "static", "stock", "switch", "tagof", "*then",
-         "while",
+         "while", "__addressof",
          "#assert", "#define", "#else", "#elseif", "#emit", "#endif", "#endinput",
          "#endscript", "#error", "#file", "#if", "#include", "#line", "#pragma",
          "#tryinclude", "#undef", "#warning",
@@ -2930,38 +3125,71 @@ static void symbol_cache_remove(symbol *sym)
   } /* if */
 }
 
-/* The local variable table must be searched backwards, so that the deepest
- * nesting of local variables is searched first. The simplest way to do
- * this is to insert all new items at the head of the list.
- * In the global list, the symbols are kept in sorted order, so that the
- * public functions are written in sorted order.
- */
-static symbol *last_global_insert;
+/* Lookup uses the global hash immediately. Queue new symbols in reverse
+ * insertion order and materialize list order only for sweeps and mutations. */
+static symbol *pending_globals;
 
-static symbol *add_symbol(symbol *root,symbol *entry,int sort)
+static symbol *merge_global_symbols(symbol *newer,symbol *older)
+{
+  symbol *first;
+  symbol **tail=&first;
+
+  while (newer!=NULL && older!=NULL) {
+    /* Equal names are inserted before older entries. Keep the old list's
+     * existing order even when an operator has been renamed in place. */
+    if (strcmp(newer->name,older->name)<=0) {
+      *tail=newer;
+      tail=&newer->next;
+      newer=newer->next;
+    } else {
+      *tail=older;
+      tail=&older->next;
+      older=older->next;
+    }
+  }
+  *tail=(newer!=NULL) ? newer : older;
+  return first;
+}
+
+static symbol *sort_pending_globals(symbol *first)
+{
+  symbol *middle=first,*fast=first->next,*second;
+
+  if (fast==NULL)
+    return first;
+  while (fast!=NULL && fast->next!=NULL) {
+    middle=middle->next;
+    fast=fast->next->next;
+  }
+  second=middle->next;
+  middle->next=NULL;
+  return merge_global_symbols(sort_pending_globals(first),sort_pending_globals(second));
+}
+
+SC_FUNC symbol *global_symbol_table(void)
+{
+  if (pending_globals!=NULL) {
+    glbtab.next=merge_global_symbols(sort_pending_globals(pending_globals),glbtab.next);
+    pending_globals=NULL;
+  }
+  return &glbtab;
+}
+
+static symbol *add_symbol(symbol *entry)
 {
   symbol *newsym;
+  symbol **head=(entry->vclass==sGLOBAL) ? &pending_globals : &loctab.next;
   PC_PROFILE_BEGIN(symbols);
-
-  if (sort) {
-    /* Every symbol preceding the last insertion compared less than its name.
-     * Skip that prefix for increasing names, preserving equal-name ordering. */
-    if (last_global_insert!=NULL && strcmp(entry->name,last_global_insert->name)>0)
-      root=last_global_insert;
-    while (root->next!=NULL && strcmp(entry->name,root->next->name)>0)
-      root=root->next;
-  }
 
   if ((newsym=(symbol *)malloc(sizeof(symbol)))==NULL) {
     error(103);
     return NULL;
   } /* if */
   memcpy(newsym,entry,sizeof(symbol));
-  newsym->next=root->next;
-  root->next=newsym;
+  /* Locals remain in reverse declaration order for nested scope lookup. */
+  newsym->next=*head;
+  *head=newsym;
   newsym->htnext=NULL;
-  if (sort)
-    last_global_insert=newsym;
   if (newsym->vclass==sGLOBAL)
     symbol_cache_add(newsym);
   PC_PROFILE_END(symbols,1);
@@ -2976,8 +3204,6 @@ static void free_symbol(symbol *sym)
    * kind of the symbol
    */
   assert(sym!=NULL);
-  if (sym==last_global_insert)
-    last_global_insert=NULL;
   if (sym->ident==iFUNCTN) {
     /* run through the argument list; "default array" arguments
      * must be freed explicitly; the tag list must also be freed */
@@ -3023,6 +3249,8 @@ SC_FUNC void delete_symbol(symbol *root,symbol *sym)
    * (this function assumes that you will never delete a symbol that is not
    * in the table pointed at by "root")
    */
+  if (root==&glbtab)
+    global_symbol_table();
   assert(root!=sym);
   while (root->next!=sym) {
     root=root->next;
@@ -3041,7 +3269,7 @@ SC_FUNC void delete_symbols(symbol *root,int level,int delete_labels,int delete_
   int mustdelete;
 
   if (root==&glbtab)
-    last_global_insert=NULL;
+    global_symbol_table();
 
   /* erase only the symbols with a deeper nesting level than the
    * specified nesting level */
@@ -3124,9 +3352,9 @@ SC_FUNC void rename_symbol(symbol *sym,const char *newname)
   const int isglobal=(sym->vclass==sGLOBAL);
 
   if (isglobal) {
+    global_symbol_table();
     symbol_cache_remove(sym);
     sym->htnext=NULL;
-    last_global_insert=NULL;
   }
   strcpy(sym->name,newname);
   if (isglobal)
@@ -3216,12 +3444,12 @@ static void insert_referrer_hash(symbol **table,int capacity,symbol *bywhom)
   table[slot]=bywhom;
 }
 
-static void grow_referrer_hash(symbol *entry,int capacity)
+static int grow_referrer_hash(symbol *entry,int capacity)
 {
   symbol **table=(symbol **)calloc(capacity,sizeof(*table));
   int i,count=0;
   if (table==NULL)
-    return;                   /* linear lookup remains correct on allocation failure */
+    return FALSE;
   for (i=0; i<entry->numrefers; i++)
     if (entry->refer[i]!=NULL) {
       insert_referrer_hash(table,capacity,entry->refer[i]);
@@ -3231,6 +3459,7 @@ static void grow_referrer_hash(symbol *entry,int capacity)
   entry->refer_hash=table;
   entry->refer_hash_capacity=capacity;
   entry->refer_hash_count=count;
+  return TRUE;
 }
 
 SC_FUNC int refer_symbol(symbol *entry,symbol *bywhom)
@@ -3241,8 +3470,8 @@ SC_FUNC int refer_symbol(symbol *entry,symbol *bywhom)
   assert(entry!=NULL);
   assert(entry->refer!=NULL);
 
-  if (entry->refer_hash==NULL && entry->numrefers>=32)
-    grow_referrer_hash(entry,entry->numrefers*2);
+  if (entry->refer_hash==NULL && entry->numrefers>=32 && entry->refer_capacity<=INT_MAX/2)
+    grow_referrer_hash(entry,entry->refer_capacity*2);
   if (entry->refer_hash!=NULL) {
     unsigned slot=referrer_hash(bywhom) & (entry->refer_hash_capacity-1);
     while (entry->refer_hash[slot]!=NULL) {
@@ -3257,35 +3486,42 @@ SC_FUNC int refer_symbol(symbol *entry,symbol *bywhom)
       return TRUE;
   }
 
-  /* see if there is an empty spot in the referrer list */
-  for (count=0; count<entry->numrefers && entry->refer[count]!=NULL; count++)
-    /* nothing */;
-  assert(count <= entry->numrefers);
-  if (count==entry->numrefers) {
+  count=entry->first_free_referrer;
+  if (count==entry->refer_capacity) {
     symbol **refer;
-    int newsize=2*entry->numrefers;
-    assert(newsize>0);
-    /* grow the referrer list */
-    refer=(symbol**)realloc(entry->refer,newsize*sizeof(symbol*));
-    if (refer==NULL)
-      return FALSE;             /* insufficient memory */
-    /* initialize the new entries */
-    entry->refer=refer;
-    for (count=entry->numrefers; count<newsize; count++)
-      entry->refer[count]=NULL;
-    count=entry->numrefers;     /* first empty spot */
-    entry->numrefers=newsize;
-  } /* if */
+    int newsize;
 
-  /* add the referrer */
-  assert(entry->refer[count]==NULL);
-  entry->refer[count]=bywhom;
+    if (entry->refer_capacity>INT_MAX/2)
+      return FALSE;
+    newsize=2*entry->refer_capacity;
+    if ((size_t)newsize>(size_t)-1/sizeof(*refer))
+      return FALSE;
+    refer=(symbol**)realloc(entry->refer,newsize*sizeof(*refer));
+    if (refer==NULL)
+      return FALSE;
+    entry->refer=refer;
+    entry->refer_capacity=newsize;
+  }
+
+  assert(count<=entry->numrefers);
+  if (count==entry->numrefers)
+    entry->numrefers++;
+  entry->refer[count++]=bywhom;
+  while (count<entry->numrefers && entry->refer[count]!=NULL)
+    count++;
+  entry->first_free_referrer=count;
+
   if (entry->refer_hash!=NULL) {
     int capacity=entry->refer_hash_capacity;
-    if ((entry->refer_hash_count+1)*2>=capacity)
-      grow_referrer_hash(entry,capacity*2);
-    if (entry->refer_hash_capacity==capacity) {
-      insert_referrer_hash(entry->refer_hash,entry->refer_hash_capacity,bywhom);
+    if (entry->refer_hash_count+1>=capacity/2) {
+      /* Rebuilding also inserts the referrer just written above. */
+      if (capacity>INT_MAX/2 || !grow_referrer_hash(entry,capacity*2)) {
+        free(entry->refer_hash);
+        entry->refer_hash=NULL;
+        entry->refer_hash_capacity=entry->refer_hash_count=0;
+      }
+    } else {
+      insert_referrer_hash(entry->refer_hash,capacity,bywhom);
       entry->refer_hash_count++;
     }
   }
@@ -3408,14 +3644,11 @@ SC_FUNC symbol *addsym(const char *name,cell addr,int ident,int vclass,int tag,i
   entry.usage=(char)usage;
   entry.fnumber=-1;     /* assume global visibility (ignored for local symbols) */
   entry.lnumber=fline;
-  entry.numrefers=1;
+  entry.refer_capacity=1;
   entry.refer=refer;
 
   /* then insert it in the list */
-  if (vclass==sGLOBAL)
-    return add_symbol(&glbtab,&entry,TRUE);
-  else
-    return add_symbol(&loctab,&entry,FALSE);
+  return add_symbol(&entry);
 }
 
 SC_FUNC symbol *addvariable(const char *name,cell addr,int ident,int vclass,int tag,

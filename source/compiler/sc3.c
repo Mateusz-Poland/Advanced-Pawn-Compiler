@@ -512,6 +512,7 @@ static int plnge_rel(int *opstr,int opoff,int (*hier)(value *lval),value *lval)
       error(212);
     if (count>0) {
       relop_prefix();
+      lval2.boolresult=lval->boolresult;
       *lval=lval2;      /* copy right hand expression of the previous iteration */
     } /* if */
     opidx+=opoff;
@@ -747,7 +748,7 @@ SC_FUNC int sc_getstateid(constvalue **automaton,constvalue **state)
       return 0;
     tokeninfo(&val,&str);        /* do not copy the name yet, must check automaton first */
     if (*automaton==NULL) {
-      error(86,name);            /* unknown automaton */
+      error_suggest(86,name,NULL,estAUTOMATON,0);            /* unknown automaton */
       return 0;
     } /* if */
     assert((*automaton)->index>0);
@@ -767,7 +768,7 @@ SC_FUNC int sc_getstateid(constvalue **automaton,constvalue **state)
     char *fsaname=(*automaton)->name;
     if (*fsaname=='\0')
       fsaname="<main>";
-    error(87,name,fsaname);   /* unknown state for automaton */
+    error_suggest(87,name,fsaname,estSTATE,fsa);   /* unknown state for automaton */
     return 0;
   } /* if */
 
@@ -1313,13 +1314,106 @@ static int hier2(value *lval)
     lvalue=hier2(lval);
     lval->tag=tag;
     return lvalue;
+  case t__ADDRESSOF: {
+    extern char *sc_tokens[];
+    static const char allowed_sym_types[]="-variable, array, array cell, label or function-";
+    paranthese=0;
+    while (matchtoken('('))
+      paranthese++;
+    tok=lex(&val,&st);
+    if (tok!=tSYMBOL)
+      return error_suggest(20,st,NULL,estNONSYMBOL,tok);    /* invalid symbol name */
+    sym=findloc(st);
+    if (sym==NULL)
+      sym=findglb(st,sSTATEVAR);
+    if (sym==NULL) {
+      return error_suggest(17,st,NULL,estSYMBOL,esfADDRESSOF);  /* undefined symbol */
+    } else if ((sym->usage & uDEFINE)==0) {
+      /* the symbol is defined after the point of its use,
+         so the compiler can't know its address yet
+       */
+      return error(17,st);      /* undefined symbol (don't suggest other symbols) */
+    } /* if */
+    /* Mark the symbol as read, so the compiler won't throw it away
+     * if it's only indirectly used from "__addressof" */
+    if (sc_status!=statSKIP)
+      markusage(sym,uREAD);
+    clear_value(lval);
+    lval->ident=iCONSTEXPR;
+    switch (sym->ident) {
+    case iVARIABLE:
+    case iREFERENCE:
+    case iARRAY:
+    case iREFARRAY:
+      if (sym->vclass==sLOCAL) {
+        lval->ident=iEXPRESSION;
+        address(sym,sPRI);
+        break;
+      } /* if */
+      /* fallthrough */
+    case iFUNCTN:
+    case iLABEL:
+      lval->constval=sym->addr;
+      if (sym->ident==iFUNCTN) {
+        if ((sym->usage & uNATIVE)!=0)
+          error(1,allowed_sym_types,sc_tokens[teNATIVE-tFIRST]);
+        break;
+      } else if (sym->ident==iARRAY || sym->ident==iREFARRAY) {
+        cell arrayidx=0,numoffsets=0,offsmul=1;
+        int level;
+        symbol *subsym=sym;
+        if (!matchtoken('['))
+          break;
+        lexpush();
+        for (level=0; matchtoken('['); level++) {
+          if (subsym!=NULL) {
+            val=0;
+            constexpr(&val,NULL,NULL);
+            if (val<0 || (subsym->dim.array.length>0 && (ucell)val>=subsym->dim.array.length)) {
+              error(32,sym->name);
+              val=0;
+            }
+            numoffsets+=offsmul;
+            offsmul*=subsym->dim.array.length;
+            arrayidx=(arrayidx*subsym->dim.array.length)+val;
+            subsym=finddepend(subsym);
+          } else {
+            constexpr(&val,NULL,NULL);
+          }
+          needtoken(']');
+        } /* for */
+        if (level>sym->dim.array.level+1)
+          error(28,sym->name);    /* invalid subscript */
+        while (subsym!=NULL) {
+          numoffsets+=offsmul;
+          offsmul*=subsym->dim.array.length;
+          arrayidx*=subsym->dim.array.length;
+          subsym=finddepend(subsym);
+        } /* if */
+        lval->constval+=(numoffsets-1+arrayidx)*(cell)sizeof(cell);
+      } /* if */
+      break;
+    case iCONSTEXPR:
+      error(1,allowed_sym_types,sc_tokens[teNUMERIC-tFIRST]);
+      break;
+    default:
+      assert(0);
+    } /* switch */
+    if (lval->ident==iCONSTEXPR)
+      ldconst(lval->constval,sPRI);
+    while (paranthese--)
+      needtoken(')');
+    if (strchr((char*)pline,PREPROC_TERM)!=NULL)
+      return error(94); /* "__addressof" operator is invalid in preprocessor directives */
+    return FALSE;
+  } /* case */
   case tDEFINED:
     paranthese=0;
     while (matchtoken('('))
       paranthese++;
     tok=lex(&val,&st);
     if (tok!=tSYMBOL)
-      return error(20,st);      /* illegal symbol name */
+      return error_suggest(20,st,NULL,estNONSYMBOL,tok);      /* illegal symbol name */
     sym=findloc(st);
     if (sym==NULL)
       sym=findglb(st,sSTATEVAR);
@@ -1342,18 +1436,18 @@ static int hier2(value *lval)
       paranthese++;
     tok=lex(&val,&st);
     if (tok!=tSYMBOL)
-      return error(20,st);      /* illegal symbol name */
+      return error_suggest(20,st,NULL,estNONSYMBOL,tok);      /* illegal symbol name */
     sym=findloc(st);
     if (sym==NULL)
       sym=findglb(st,sSTATEVAR);
     if (sym==NULL)
-      return error(17,st);      /* undefined symbol */
+      return error_suggest(17,st,NULL,estSYMBOL,esfVARCONST);      /* undefined symbol */
     if (sym->ident==iCONSTEXPR)
       error(39);                /* constant symbol has no size */
     else if (sym->ident==iFUNCTN || sym->ident==iREFFUNC)
       error(72);                /* "function" symbol has no size */
     else if ((sym->usage & uDEFINE)==0)
-      return error(17,st);      /* undefined symbol (symbol is in the table, but it is "used" only) */
+      return error_suggest(17,st,NULL,estSYMBOL,esfVARCONST);      /* undefined symbol (symbol is in the table, but it is "used" only) */
     clear_value(lval);
     lval->ident=iCONSTEXPR;
     lval->constval=1;           /* preset */
@@ -1368,7 +1462,7 @@ static int hier2(value *lval)
           int cmptag=subsym->x.tags.index;
           tokeninfo(&val,&idxname);
           if ((idxsym=findconst(idxname,&cmptag))==NULL)
-            error(80,idxname);  /* unknown symbol, or non-constant */
+            error_suggest(80,idxname,NULL,estSYMBOL,esfCONST);  /* unknown symbol, or non-constant */
           else if (cmptag>1)
             error(91,idxname);  /* ambiguous constant */
         } /* if */
@@ -1383,7 +1477,7 @@ static int hier2(value *lval)
       else
         lval->constval=array_levelsize(sym,level);
       if (lval->constval==0 && strchr((char *)lptr,PREPROC_TERM)==NULL)
-        error(224,st);          /* indeterminate array size in "sizeof" expression */
+        error(224,sym->name);          /* indeterminate array size in "sizeof" expression */
     } /* if */
     ldconst(lval->constval,sPRI);
     while (paranthese--)
@@ -1395,7 +1489,7 @@ static int hier2(value *lval)
       paranthese++;
     tok=lex(&val,&st);
     if (tok!=tSYMBOL && tok!=tLABEL)
-      return error(20,st);      /* illegal symbol name */
+      return error_suggest(20,st,NULL,estNONSYMBOL,tok);      /* illegal symbol name */
     if (tok==tLABEL) {
       constvalue *tagsym=find_constval(&tagname_tab,st,0);
       tag=(int)((tagsym!=NULL) ? tagsym->value : 0);
@@ -1404,9 +1498,9 @@ static int hier2(value *lval)
       if (sym==NULL)
         sym=findglb(st,sSTATEVAR);
       if (sym==NULL)
-        return error(17,st);      /* undefined symbol */
+        return error_suggest(17,st,NULL,estSYMBOL,esfNONLABEL);      /* undefined symbol */
       if ((sym->usage & uDEFINE)==0)
-        return error(17,st);      /* undefined symbol (symbol is in the table, but it is "used" only) */
+        return error_suggest(17,st,NULL,estSYMBOL,esfNONLABEL);      /* undefined symbol (symbol is in the table, but it is "used" only) */
       tag=sym->tag;
     } /* if */
     if (sym!=NULL && (sym->ident==iARRAY || sym->ident==iREFARRAY)) {
@@ -1420,7 +1514,7 @@ static int hier2(value *lval)
           int cmptag=subsym->x.tags.index;
           tokeninfo(&val,&idxname);
           if ((idxsym=findconst(idxname,&cmptag))==NULL)
-            error(80,idxname);  /* unknown symbol, or non-constant */
+            error_suggest(80,idxname,NULL,estSYMBOL,esfCONST);  /* unknown symbol, or non-constant */
           else if (cmptag>1)
             error(91,idxname);  /* ambiguous constant */
         } /* if */
@@ -1599,7 +1693,7 @@ restart:
         needtoken(close);
         return FALSE;
       } else if (sym->ident!=iARRAY && sym->ident!=iREFARRAY){
-        error(28,sym->name);    /* cannot subscript, variable is not an array */
+        error_suggest(28,sym->name,NULL,estSYMBOL,esfARRAY);
         needtoken(close);
         return FALSE;
       } else if (sym->dim.array.level>0 && close!=']') {
@@ -1834,6 +1928,8 @@ static int primary(value *lval)
         ldconst(0,sPRI);    /* load 0 */
         return FALSE;       /* return 0 for labels (expression error) */
       } /* if */
+      if ((sym->usage & uDEFINE)==0)
+        error_suggest(17,st,NULL,estSYMBOL,esfVARCONST);    /* undefined symbol */
       lval->sym=sym;
       lval->ident=sym->ident;
       lval->tag=sym->tag;
@@ -1852,10 +1948,10 @@ static int primary(value *lval)
          * implemented, issue an error
          */
         if ((sym->usage & uPROTOTYPED)==0)
-          error(17,st);
+          error_suggest(17,st,NULL,estSYMBOL,esfFUNCTION);
       } else {
         if ((sym->usage & uDEFINE)==0)
-          error(17,st);
+          error_suggest(17,st,NULL,estSYMBOL,esfVARCONST);
         lval->sym=sym;
         lval->ident=sym->ident;
         lval->tag=sym->tag;
@@ -1868,7 +1964,7 @@ static int primary(value *lval)
       } /* if */
     } else {
       if (!sc_allowproccall)
-        return error(17,st);    /* undefined symbol */
+        return error_suggest(17,st,NULL,estSYMBOL,esfVARCONST);    /* undefined symbol */
       /* an unknown symbol, but used in a way compatible with the "procedure
        * call" syntax. So assume that the symbol refers to a function.
        */

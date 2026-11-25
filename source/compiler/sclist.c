@@ -113,27 +113,6 @@ static stringpair *find_stringpair(stringpair *cur,char *first,int matchlength)
   return NULL;
 }
 
-static int delete_stringpair(stringpair *root,stringpair *item)
-{
-  stringpair *cur;
-
-  assert(root!=NULL);
-  cur=root;
-  while (cur->next!=NULL) {
-    if (cur->next==item) {
-      cur->next=item->next;     /* unlink from list */
-      assert(item->first!=NULL);
-      assert(item->second!=NULL);
-      free(item->first);
-      free(item->second);
-      free(item);
-      return TRUE;
-    } /* if */
-    cur=cur->next;
-  } /* while */
-  return FALSE;
-}
-
 /* ----- string list functions ----------------------------------- */
 static stringlist *insert_string(stringlist *list,char *string)
 {
@@ -238,6 +217,7 @@ static stringlist includepaths = {NULL, NULL, 0, 0};  /* directory list for incl
 
 SC_FUNC stringlist *insert_path(char *path)
 {
+  clear_include_cache();
   return insert_string(&includepaths,path);
 }
 
@@ -256,66 +236,123 @@ SC_FUNC void delete_pathtable(void)
 /* ----- text substitution patterns ------------------------------ */
 #if !defined NO_DEFINE
 
-static stringpair substpair = { NULL, NULL, NULL};  /* list of substitution pairs */
+typedef struct {
+  stringpair pair;
+  uint32_t hash;
+} macro_definition;
 
-static stringpair *substindex['z'-PUBLIC_CHAR+1]; /* quick index to first character */
-static void adjustindex(char c)
+static stringpair **macro_buckets;
+static size_t macro_capacity,macro_count;
+
+/* Hash only the identifier prefix, so function-like patterns and plain
+ * definitions with the same name retain the existing redefinition rules. */
+static uint32_t macro_hash(const char *name,int length)
 {
-  stringpair *cur;
-  assert(c>='A' && c<='Z' || c>='a' && c<='z' || c=='_' || c==PUBLIC_CHAR);
-  assert(PUBLIC_CHAR<'A' && 'A'<'_' && '_'<'z');
+  uint32_t hash=UINT32_C(2166136261);
+  while (length-->0)
+    hash=(hash^(unsigned char)*name++)*UINT32_C(16777619);
+  return hash;
+}
 
-  for (cur=substpair.next; cur!=NULL && cur->first[0]!=c; cur=cur->next)
-    /* nothing */;
-  substindex[(int)c-PUBLIC_CHAR]=cur;
+static void grow_macro_table(void)
+{
+  size_t i,capacity=macro_capacity ? macro_capacity*2 : 64;
+  stringpair **buckets=(stringpair**)calloc(capacity,sizeof(*buckets));
+
+  if (buckets==NULL)
+    error(103);
+  for (i=0; i<macro_capacity; i++) {
+    stringpair *item=macro_buckets[i];
+    while (item!=NULL) {
+      stringpair *next=item->next;
+      size_t slot=((macro_definition*)item)->hash & (capacity-1);
+      item->next=buckets[slot];
+      buckets[slot]=item;
+      item=next;
+    }
+  }
+  free(macro_buckets);
+  macro_buckets=buckets;
+  macro_capacity=capacity;
+}
+
+static stringpair **find_macro_slot(const char *name,int length)
+{
+  uint32_t hash=macro_hash(name,length);
+  stringpair **slot=&macro_buckets[hash & (macro_capacity-1)];
+
+  while (*slot!=NULL) {
+    macro_definition *definition=(macro_definition*)*slot;
+    if (definition->hash==hash && definition->pair.matchlength==length
+        && memcmp(definition->pair.first,name,length)==0)
+      break;
+    slot=&definition->pair.next;
+  }
+  return slot;
 }
 
 SC_FUNC stringpair *insert_subst(char *pattern,char *substitution,int prefixlen)
 {
-  stringpair *cur;
+  size_t pattern_size=strlen(pattern)+1;
+  size_t substitution_size=strlen(substitution)+1;
+  macro_definition *definition;
+  stringpair *item;
+  size_t slot;
 
-  assert(pattern!=NULL);
-  assert(substitution!=NULL);
-  if ((cur=insert_stringpair(&substpair,pattern,substitution,prefixlen))==NULL)
-    error(103);       /* insufficient memory (fatal error) */
-  adjustindex(*pattern);
-  return cur;
+  if (macro_count==macro_capacity)
+    grow_macro_table();
+  definition=(macro_definition*)malloc(sizeof(*definition)+pattern_size+substitution_size);
+  if (definition==NULL)
+    error(103);
+  definition->hash=macro_hash(pattern,prefixlen);
+  item=&definition->pair;
+  item->first=(char*)(definition+1);
+  item->second=item->first+pattern_size;
+  item->matchlength=prefixlen;
+  memcpy(item->first,pattern,pattern_size);
+  memcpy(item->second,substitution,substitution_size);
+  slot=definition->hash & (macro_capacity-1);
+  item->next=macro_buckets[slot];
+  macro_buckets[slot]=item;
+  macro_count++;
+  return item;
 }
 
 SC_FUNC stringpair *find_subst(char *name,int length)
 {
-  stringpair *item;
-  assert(name!=NULL);
   assert(length>0);
-  assert(*name>='A' && *name<='Z' || *name>='a' && *name<='z' || *name=='_' || *name==PUBLIC_CHAR);
-  item=substindex[(int)*name-PUBLIC_CHAR];
-  if (item!=NULL)
-    item=find_stringpair(item,name,length);
-  return item;
+  return macro_count ? *find_macro_slot(name,length) : NULL;
 }
 
 SC_FUNC int delete_subst(char *name,int length)
 {
-  stringpair *item;
-  assert(name!=NULL);
-  assert(length>0);
-  assert(*name>='A' && *name<='Z' || *name>='a' && *name<='z' || *name=='_' || *name==PUBLIC_CHAR);
-  item=substindex[(int)*name-PUBLIC_CHAR];
-  if (item!=NULL)
-    item=find_stringpair(item,name,length);
-  if (item==NULL)
-    return FALSE;
-  delete_stringpair(&substpair,item);
-  adjustindex(*name);
-  return TRUE;
+  if (macro_count) {
+    stringpair **slot=find_macro_slot(name,length);
+    if (*slot!=NULL) {
+      stringpair *item=*slot;
+      *slot=item->next;
+      free(item);
+      macro_count--;
+      return TRUE;
+    }
+  }
+  return FALSE;
 }
 
 SC_FUNC void delete_substtable(void)
 {
-  int i;
-  delete_stringpairtable(&substpair);
-  for (i=0; i<sizeof substindex/sizeof substindex[0]; i++)
-    substindex[i]=NULL;
+  size_t i;
+  for (i=0; i<macro_capacity; i++) {
+    stringpair *item=macro_buckets[i];
+    while (item!=NULL) {
+      stringpair *next=item->next;
+      free(item);
+      item=next;
+    }
+  }
+  free(macro_buckets);
+  macro_buckets=NULL;
+  macro_capacity=macro_count=0;
 }
 
 #endif /* !defined NO_SUBST */

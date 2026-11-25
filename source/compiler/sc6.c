@@ -30,6 +30,9 @@
   #include <alloc/fortify.h>
 #endif
 #include "lstring.h"
+#if !defined SC_LIGHT && !defined __MSDOS__
+  #include "memfile.h"
+#endif
 #include "sc.h"
 #include "../amx/amxdbg.h"
 #if defined LINUX || defined __FreeBSD__ || defined __OpenBSD__
@@ -252,11 +255,18 @@ static unsigned char *encode_cell(ucell c,int *len)
   int index;
 
   assert(len!=NULL);
+  /* Small signed immediate values fit in one signed 7-bit group. */
+  if (c<=0x3f || c>=(ucell)-64) {
+    buffer[ENC_MAX-1]=(unsigned char)(c & 0x7f);
+    *len=1;
+    return buffer+ENC_MAX-1;
+  }
   index=ENC_MAX-1;
   do {
     buffer[index--]=(unsigned char)(c & 0x7f);  /* store 7 bits */
     c>>=7;
   } while (index>=0);
+  index=0;
   /* skip leading zeros */
   while (index<ENC_MAX-1 && buffer[index]==0 && (buffer[index+1] & 0x40)==0)
     index++;
@@ -795,6 +805,196 @@ static void append_amx_entry(unsigned char *metadata,long *stubofs,long *nameofs
   *nameofs+=length;
 }
 
+static char *read_asm_line(FILE *fin,char *line,int size)
+{
+  char *result;
+  PC_PROFILE_BEGIN(asm_read);
+  result=pc_readasm(fin,line,size);
+  PC_PROFILE_END(asm_read,result!=NULL);
+  return result;
+}
+
+static int read_asm_opcode(char *instr,char **params)
+{
+  char *end;
+  int op;
+  PC_PROFILE_BEGIN(asm_opcode);
+  for (end=instr; *end!='\0' && !isspace((unsigned char)*end); end++)
+    /* nothing */;
+  op=findopcode(instr,(int)(end-instr));
+  *params=end;
+  PC_PROFILE_END(asm_opcode,1);
+  return op;
+}
+
+static cell call_asm_handler(int op,FILE *fout,char *params)
+{
+  cell size;
+  PC_PROFILE_BEGIN(asm_operands);
+  size=opcodelist[op].func(fout,skipwhitespace(params),opcodelist[op].opcode);
+  PC_PROFILE_END(asm_operands,1);
+  return size;
+}
+
+#if !defined SC_LIGHT && !defined __MSDOS__
+  #define HAS_ASM_INDEX
+  /* Four bytes per instruction. Cap the optional index across both segments. */
+  #define ASM_INDEX_LIMIT (16u*1024u*1024u/sizeof(uint32_t))
+
+typedef struct {
+  uint32_t *records;
+  size_t count,capacity;
+  #if defined PC_TIMING
+    size_t instructions;
+  #endif
+  long previous;
+} asm_index;
+
+static asm_index code_records,data_records;
+static int asm_index_ready;
+static short asm_index_file;
+
+static int push_asm_record(asm_index *index,uint32_t record)
+{
+  if (index->count==index->capacity) {
+    size_t other=(index==&code_records ? data_records.capacity : code_records.capacity);
+    size_t capacity=index->capacity ? index->capacity+index->capacity/2 : 1024;
+    uint32_t *records;
+    if (capacity>ASM_INDEX_LIMIT-other)
+      capacity=ASM_INDEX_LIMIT-other;
+    if (capacity<=index->capacity)
+      return FALSE;
+    records=(uint32_t*)realloc(index->records,capacity*sizeof(*records));
+    if (records==NULL)
+      return FALSE;
+    index->records=records;
+    index->capacity=capacity;
+  }
+  index->records[index->count++]=record;
+  return TRUE;
+}
+
+static int index_asm_line(asm_index *index,long offset,unsigned int column,unsigned int op)
+{
+  long delta=offset-index->previous;
+  if (column>255 || op>255)
+    return FALSE;
+  /* An opcode of zero advances over a long gap without emitting anything. */
+  while (delta>65535) {
+    if (!push_asm_record(index,65535))
+      return FALSE;
+    delta-=65535;
+  }
+  index->previous=offset;
+  #if defined PC_TIMING
+    index->instructions++;
+  #endif
+  return push_asm_record(index,(uint32_t)delta | ((uint32_t)column<<16) | ((uint32_t)op<<24));
+}
+#endif
+
+SC_FUNC void clear_asm_index(void)
+{
+  #if defined HAS_ASM_INDEX
+    free(code_records.records);
+    free(data_records.records);
+    memset(&code_records,0,sizeof code_records);
+    memset(&data_records,0,sizeof data_records);
+    asm_index_ready=FALSE;
+  #endif
+  free(lbltab);
+  lbltab=NULL;
+}
+
+#if defined HAS_ASM_INDEX
+static int prepare_asm_index(FILE *fin,char *line,int line_size)
+{
+  long offset;
+  memfile_t *memory=(memfile_t*)fin;
+  cell width[sizeof opcodelist/sizeof opcodelist[0]];
+  size_t i;
+  PC_PROFILE_COUNTER(lines);
+  PC_PROFILE_BEGIN(asm_labels);
+
+  for (i=1; i<sizeof width/sizeof width[0]; i++) {
+    OPCODE_PROC fn=opcodelist[i].func;
+    width[i]=-1;
+    if (fn==parm0) width[i]=opcodes(1);
+    else if (fn==parm1 || fn==do_call || fn==do_jump || fn==do_switch) width[i]=opcodes(1)+opargs(1);
+    else if (fn==parm2) width[i]=opcodes(1)+opargs(2);
+    else if (fn==parm3) width[i]=opcodes(1)+opargs(3);
+    else if (fn==parm4) width[i]=opcodes(1)+opargs(4);
+    else if (fn==parm5) width[i]=opcodes(1)+opargs(5);
+    else if (fn==do_case) width[i]=opargs(2);
+    else if (fn==noop) width[i]=0;
+  }
+  lbltab=(cell*)malloc((size_t)sc_labnum*sizeof(*lbltab));
+  if (lbltab==NULL)
+    return FALSE;
+  codeindex=0;
+  pc_resetasm(fin);
+  for (offset=memory->offs; read_asm_line(fin,line,line_size)!=NULL; offset=memory->offs) {
+    char *instr=skipwhitespace(line),*params;
+    int op;
+    PC_PROFILE_INCREMENT(lines);
+    if (*instr=='\0' || *instr==';')
+      continue;
+    stripcomment(instr);
+    if ((*instr=='l' || *instr=='L') && instr[1]=='.') {
+      int label=(int)hex2long(instr+2,NULL);
+      assert(label>=0 && label<sc_labnum);
+      lbltab[label]=codeindex;
+      continue;
+    }
+    op=read_asm_opcode(instr,&params);
+    if (op==0) {
+      *params='\0';
+      error(104,instr);
+    }
+    if (opcodelist[op].segment==sIN_CSEG) {
+      if (!index_asm_line(&code_records,offset,(unsigned int)(params-line),(unsigned int)op))
+        return FALSE;
+      /* Fixed-width instructions don't need their operands during relocation. */
+      codeindex+=width[op]>=0 ? width[op] : call_asm_handler(op,NULL,params);
+    } else if (opcodelist[op].segment==sIN_DSEG) {
+      if (!index_asm_line(&data_records,offset,(unsigned int)(params-line),(unsigned int)op))
+        return FALSE;
+    }
+  }
+  asm_index_file=fcurrent;
+  PC_PROFILE_END(asm_labels,lines);
+  {
+    PC_PROFILE_BEGIN(asm_index);
+    PC_PROFILE_END(asm_index,(code_records.capacity+data_records.capacity)*sizeof(uint32_t));
+  }
+  return TRUE;
+}
+
+static void write_asm_index(FILE *fout,FILE *fin,const asm_index *index,char *line,int line_size)
+{
+  size_t i;
+  long offset=0;
+  memfile_t *memory=(memfile_t*)fin;
+  for (i=0; i<index->count; i++) {
+    uint32_t record=index->records[i];
+    unsigned int op=record>>24;
+    char *params=line;
+    offset+=(long)(record & 65535);
+    if (op==0)
+      continue;
+    if (opcodelist[op].func==parm0 || opcodelist[op].func==noop) {
+      line[0]='\0';
+    } else {
+      memory->offs=offset;
+      read_asm_line(fin,line,line_size);
+      params+=((record>>16) & 255);
+      stripcomment(params);
+    }
+    call_asm_handler(op,fout,params);
+  }
+}
+#endif
+
 SC_FUNC int assemble(FILE *fout,FILE *fin)
 {
   AMX_HEADER hdr;
@@ -808,6 +1008,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   #endif
   char *instr,*params;
   int i,pass,size;
+  unsigned char data_initial[UCHAR_MAX+1];
   int16_t maxname;
   symbol *sym, **nativelist;
   constvalue *constptr;
@@ -821,6 +1022,10 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   /* if compression failed, restart the assembly with compaction switched off */
   if (setjmp(compact_err)!=0) {
     assert(sc_compress);  /* cannot arrive here if compact encoding was disabled */
+    #if defined HAS_ASM_INDEX
+      if (!asm_index_ready)
+    #endif
+        clear_asm_index();
     sc_compress=FALSE;
     pc_resetbin(fout,0);
     error(232);           /* disabled compact encoding */
@@ -844,7 +1049,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   numpubvars=0;
   mainaddr=-1;
   /* count number of public and native functions and public variables */
-  for (sym=glbtab.next; sym!=NULL; sym=sym->next) {
+  for (sym=global_symbol_table()->next; sym!=NULL; sym=sym->next) {
     int match=0;
     if (sym->ident==iFUNCTN) {
       if ((sym->usage & uNATIVE)!=0 && (sym->usage & uREAD)!=0 && sym->addr>=0)
@@ -945,7 +1150,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   nameofs=hdr.nametable+sizeof(int16_t);
 
   /* write the public functions table */
-  for (sym=glbtab.next; sym!=NULL; sym=sym->next) {
+  for (sym=global_symbol_table()->next; sym!=NULL; sym=sym->next) {
     if (sym->ident==iFUNCTN
         && (sym->usage & uPUBLIC)!=0 && (sym->usage & uDEFINE)!=0)
     {
@@ -974,7 +1179,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     #if !defined NDEBUG
       memset(nativelist,0,numnatives*sizeof(symbol *)); /* for NULL checking */
     #endif
-    for (sym=glbtab.next; sym!=NULL; sym=sym->next) {
+    for (sym=global_symbol_table()->next; sym!=NULL; sym=sym->next) {
       if (sym->ident==iFUNCTN && (sym->usage & uNATIVE)!=0 && (sym->usage & uREAD)!=0 && sym->addr>=0) {
         assert(sym->addr < numnatives);
         nativelist[(int)sym->addr]=sym;
@@ -1005,7 +1210,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   } /* if */
 
   /* write the public variables table */
-  for (sym=glbtab.next; sym!=NULL; sym=sym->next) {
+  for (sym=global_symbol_table()->next; sym!=NULL; sym=sym->next) {
     if (sym->ident==iVARIABLE && (sym->usage & uPUBLIC)!=0) {
       if ((sym->usage & uSTOCK)!=0 && (sym->usage & (uREAD | uWRITTEN))==0)
         continue;
@@ -1037,6 +1242,31 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   if (writeerror)
     error(101,binfname);
 
+  #if defined HAS_ASM_INDEX
+    if (!asm_index_ready && sc_labnum>0 && ((memfile_t*)fin)->usedoffs>=16384) {
+      asm_index_ready=prepare_asm_index(fin,line,sizeof line);
+      if (!asm_index_ready)
+        clear_asm_index();
+    }
+    if (asm_index_ready) {
+      fcurrent=asm_index_file;
+      bytes_in=bytes_out=0;
+      {
+        PC_PROFILE_BEGIN(asm_code);
+        write_asm_index(fout,fin,&code_records,line,sizeof line);
+        PC_PROFILE_END(asm_code,code_records.count);
+      }
+      {
+        PC_PROFILE_BEGIN(asm_data);
+        write_asm_index(fout,fin,&data_records,line,sizeof line);
+        PC_PROFILE_END(asm_data,data_records.count);
+      }
+      #if defined PC_TIMING
+        instructions=code_records.instructions+data_records.instructions;
+      #endif
+    } else
+  #endif
+  {
   /* First pass: relocate all labels */
   /* This pass is necessary because the code addresses of labels is only known
    * after the peephole optimization flag. Labels can occur inside expressions
@@ -1049,15 +1279,18 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     lbltab=(cell *)malloc(sc_labnum*sizeof(cell));
     if (lbltab==NULL)
       error(103);               /* insufficient memory */
+    PC_PROFILE_COUNTER(lines);
+    PC_PROFILE_BEGIN(asm_labels);
     codeindex=0;
     pc_resetasm(fin);
-    while (pc_readasm(fin,line,sizeof line)!=NULL) {
+    while (read_asm_line(fin,line,sizeof line)!=NULL) {
+      PC_PROFILE_INCREMENT(lines);
       stripcomment(line);
       instr=skipwhitespace(line);
       /* ignore empty lines */
       if (*instr=='\0')
         continue;
-      if (tolower(*instr)=='l' && *(instr+1)=='.') {
+      if ((*instr=='l' || *instr=='L') && *(instr+1)=='.') {
         int lindex=(int)hex2long(instr+2,NULL);
         assert(lindex>=0 && lindex<sc_labnum);
         lbltab[lindex]=codeindex;
@@ -1065,56 +1298,65 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
         /* get to the end of the instruction (make use of the '\n' that fgets()
          * added at the end of the line; this way we will *always* drop on a
          * whitespace character) */
-        for (params=instr; *params!='\0' && !isspace(*params); params++)
-          /* nothing */;
-        assert(params>instr);
-        i=findopcode(instr,(int)(params-instr));
+        i=read_asm_opcode(instr,&params);
         if (opcodelist[i].name==NULL) {
           *params='\0';
           error(104,instr);     /* invalid assembler instruction */
         } /* if */
         if (opcodelist[i].segment==sIN_CSEG)
-          codeindex+=opcodelist[i].func(NULL,skipwhitespace(params),opcodelist[i].opcode);
+          codeindex+=call_asm_handler(i,NULL,params);
       } /* if */
     } /* while */
+    PC_PROFILE_END(asm_labels,lines);
   } /* if */
 
-  /* Second pass (actually 2 more passes, one for all code and one for all data) */
+  /* The code scan validates every opcode. In the data scan, skip lines whose
+   * first byte cannot start a data opcode before parsing the instruction. */
+  memset(data_initial,0,sizeof data_initial);
+  for (i=1; i<(int)(sizeof opcodelist/sizeof opcodelist[0]); i++) {
+    if (opcodelist[i].segment==sIN_DSEG) {
+      unsigned char first=(unsigned char)opcodelist[i].name[0];
+      data_initial[(unsigned char)tolower(first)]=1;
+      data_initial[(unsigned char)toupper(first)]=1;
+    }
+  }
   bytes_in=0;
   bytes_out=0;
   for (pass=sIN_CSEG; pass<=sIN_DSEG; pass++) {
+    PC_PROFILE_COUNTER(lines);
+    PC_PROFILE_BEGIN(asm_code);
+    PC_PROFILE_BEGIN(asm_data);
     pc_resetasm(fin);
-    while (pc_readasm(fin,line,sizeof line)!=NULL) {
-      stripcomment(line);
+    while (read_asm_line(fin,line,sizeof line)!=NULL) {
+      PC_PROFILE_INCREMENT(lines);
       instr=skipwhitespace(line);
-      /* ignore empty lines and labels (labels have a special syntax, so these
-       * must be parsed separately) */
-      if (*instr=='\0' || (tolower(*instr)=='l' && *(instr+1)=='.'))
+      if (pass==sIN_DSEG && !data_initial[(unsigned char)*instr])
         continue;
+      /* Comments, labels and empty lines carry no segment instructions. */
+      if (*instr=='\0' || *instr==';' || ((*instr=='l' || *instr=='L') && instr[1]=='.'))
+        continue;
+      stripcomment(instr);
       /* get to the end of the instruction (make use of the '\n' that fgets()
        * added at the end of the line; this way we will *always* drop on a
        * whitespace character) */
-      for (params=instr; *params!='\0' && !isspace(*params); params++)
-        /* nothing */;
-      assert(params>instr);
-      i=findopcode(instr,(int)(params-instr));
+        i=read_asm_opcode(instr,&params);
       if (opcodelist[i].name==NULL)
         error(104, stripwhitespace(instr)); /* invalid assembler instruction */
       if (opcodelist[i].segment==pass) {
         PC_PROFILE_INCREMENT(instructions);
-        opcodelist[i].func(fout,skipwhitespace(params),opcodelist[i].opcode);
+        call_asm_handler(i,fout,params);
       }
     } /* while */
+    if (pass==sIN_CSEG)
+      PC_PROFILE_END(asm_code,lines);
+    else
+      PC_PROFILE_END(asm_data,lines);
   } /* for */
+  }
   if (bytes_out-bytes_in>0)
     error(105);         /* compression buffer overflow */
 
-  if (lbltab!=NULL) {
-    free(lbltab);
-    #if !defined NDEBUG
-      lbltab=NULL;
-    #endif
-  } /* if */
+  clear_asm_index();
 
   if (sc_compress) {
     filesize=pc_lengthbin(fout);/* get this value before appending debug info */

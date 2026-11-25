@@ -1,25 +1,11 @@
-# Development status
+# Validation status
 
-This repository snapshot is a working development tree for APC 3.11.0. It is not a declaration that the compiler is ready for a stable release.
+This release is APC 3.11.0. The package contains x86 Windows binaries built from the accompanying sources.
 
-## Validation completed for this packaged tree
+- Clean MSVC x86 build via build.bat. The compiler driver, DLL and disassembler were exercised.
+- CMake Release build with MSVC and Ninja. All seven CTest cases passed.
+- The extended Windows PowerShell suite passed, including direct and mutual recursion, a 20,000-call chain, and 32,769 public functions declared out of order.
+- Version 3.11.0 and the Pawn numeric version 779 were checked.
+- See [PERFORMANCE.ru.md](../PERFORMANCE.ru.md) for the tested workloads, AMX hashes and timings.
 
-- Linux Release configuration and build with CMake/GCC.
-- CTest regression suite: 7 of 7 tests passed.
-- Compilation of the included large SA-MP-style `big_test.pwn` fixture.
-- `__Pawn` numeric value checked against the 3.11 encoding (`779`).
-
-These checks cover only the listed configurations and inputs.
-
-## Work still required before a stable release
-
-- Complete deterministic allocation-failure testing, including allocation failures during global initialization and hash-table growth.
-- Audit allocations and cleanup across fatal-error paths that use `longjmp`.
-- Verify `duplicatestring()` callers and all allocation-failure return paths.
-- Check that referrer-hash growth failure always has a safe fallback and cannot result in an unbounded probe.
-- Run the PowerShell regression script on Windows.
-- Build and test the x86 MSVC configuration using the supplied `build.bat`.
-- Run ASan/UBSan/LSan or equivalent memory diagnostics on the final post-fix source tree.
-- Compare output and runtime behavior against the selected upstream Pawn compiler versions on real projects.
-
-Do not use this list as a substitute for testing the current source. Each item must be re-checked after code changes.
+Remaining validation includes a Linux build of this revision, sanitizers and deterministic allocation-failure tests, and execution of the AMX files in a SA-MP or open.mp server.

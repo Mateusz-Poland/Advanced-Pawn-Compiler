@@ -198,10 +198,12 @@ void *pc_createtmpsrc(char **filename)
 
   #if defined	__WIN32__ || defined _WIN32
     tname=_tempnam(NULL,"pawn");
-    ftmp=fopen(tname,"wt");
+    if (tname!=NULL)
+      ftmp=fopen(tname,"wt");
   #elif defined __MSDOS__ || defined _Windows
     tname=tempnam(NULL,"pawn");
-    ftmp=fopen(tname,"wt");
+    if (tname!=NULL)
+      ftmp=fopen(tname,"wt");
   #else
     static const char template[]="/tmp/pawnXXXXXX";
     if ((tname=malloc(sizeof(template)))!=NULL) {

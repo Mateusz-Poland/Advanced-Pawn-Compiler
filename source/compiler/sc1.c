@@ -107,13 +107,19 @@ static void funcstub(int fnative);
 static int newfunc(char *firstname,int firsttag,int fpublic,int fstatic,int stock);
 static int declargs(symbol *sym,int chkshadow);
 static void doarg(char *name,int ident,int offset,int tags[],int numtags,
-                  int fpublic,int fconst,int chkshadow,arginfo *arg);
+                  int fpublic,int fconst,int written,int chkshadow,arginfo *arg);
 static void make_report(symbol *root,FILE *log,char *sourcefile);
 static void reduce_referrers(symbol *root);
 static long max_stacksize(symbol *root,int *recursion);
 static int testsymbols(symbol *root,int level,int testlabs,int testconst);
 static void destructsymbols(symbol *root,int level);
 static constvalue *find_constval_byval(constvalue_root *table,cell val);
+
+/* Tag IDs live in declaration order for AMX output. Index their names only
+ * once there are enough tags to make linear lookups expensive. */
+static constvalue **tag_index;
+static size_t tag_count,tag_index_capacity;
+static int tag_max_id;
 static symbol *fetchlab(char *name);
 static void statement(int *lastindent,int allow_decl);
 static void compound(int stmt_sameline,int starttok);
@@ -284,10 +290,12 @@ void *pc_createtmpsrc(char **filename)
 
   #if defined	__WIN32__ || defined _WIN32
     tname=_tempnam(NULL,"pawn");
-    ftmp=fopen(tname,"wt");
+    if (tname!=NULL)
+      ftmp=fopen(tname,"wt");
   #elif defined __MSDOS__ || defined _Windows
     tname=tempnam(NULL,"pawn");
-    ftmp=fopen(tname,"wt");
+    if (tname!=NULL)
+      ftmp=fopen(tname,"wt");
   #else
     static const char template[]="/tmp/pawnXXXXXX";
     if ((tname=malloc(sizeof(template)))!=NULL) {
@@ -509,7 +517,15 @@ static void pc_profile_report(void)
     "symbol handling (updates and lookups)", "call graph (symbols)",
     "stack analysis (functions)", "code generation (staging bytes)",
     "peephole (pattern checks)", "assembler (instructions)",
-    "AMX metadata (bytes)", "AMX write/seek (bytes written)"
+    "AMX metadata (bytes)", "AMX write/seek (bytes written)",
+    "assembly label/index pass (lines)", "assembly code pass (records/lines)",
+    "assembly data pass (records/lines)", "assembly line reads (lines)",
+    "mnemonic parse and lookup (opcodes)", "assembly operand handlers",
+    "assembly index capacity (bytes)",
+    "include path search (requests)", "include current directory (hits)",
+    "include source directory (hits)", "include -i candidates (hits)",
+    "include extension probes (opens)", "include failed search (misses)",
+    "include cache (hits)"
   };
   int i;
   fprintf(stderr,"[timing] Inclusive wall times, completed calls only\n");
@@ -528,6 +544,8 @@ int pc_compile(int argc, char *argv[])
   char reportname[_MAX_PATH];
   char codepage[MAXCODEPAGE+1];
   FILE *volatile binf;
+  FILE *volatile merged_source=NULL;
+  char *volatile merged_name=NULL;
   void *inpfmark;
   int lcl_packstr,lcl_needsemicolon,lcl_tabsize;
   #if !defined SC_LIGHT
@@ -594,10 +612,15 @@ int pc_compile(int argc, char *argv[])
   assert(get_sourcefile(0)!=NULL);  /* there must be at least one source file */
   if (get_sourcefile(1)!=NULL) {
     /* there are at least two or more source files */
-    char *tname,*sname;
-    FILE *ftmp,*fsrc;
+    char *tname=NULL,*sname;
+    FILE *fsrc;
     int fidx;
-    ftmp=pc_createtmpsrc(&tname);
+    merged_source=pc_createtmpsrc(&tname);
+    if (merged_source==NULL || tname==NULL) {
+      free(tname);
+      error(101,get_sourcefile(0));
+    }
+    merged_name=tname;
     for (fidx=0; (sname=get_sourcefile(fidx))!=NULL; fidx++) {
       unsigned char tstring[128];
       fsrc=(FILE*)pc_opensrc(sname);
@@ -605,18 +628,25 @@ int pc_compile(int argc, char *argv[])
         strcpy(inpfname,sname); /* avoid invalid filename */
         error(100,sname);
       } /* if */
-      pc_writesrc(ftmp,(unsigned char*)"#file \"");
-      pc_writesrc(ftmp,(unsigned char*)sname);
-      pc_writesrc(ftmp,(unsigned char*)"\"\n");
-      while (!pc_eofsrc(fsrc)) {
-        pc_readsrc(fsrc,tstring,sizeof tstring);
-        pc_writesrc(ftmp,tstring);
-      } /* while */
+      if (!pc_writesrc(merged_source,(unsigned char*)"#file \"")
+          || !pc_writesrc(merged_source,(unsigned char*)sname)
+          || !pc_writesrc(merged_source,(unsigned char*)"\"\n")) {
+        pc_closesrc(fsrc);
+        error(101,merged_name);
+      }
+      while (pc_readsrc(fsrc,tstring,sizeof tstring)!=NULL) {
+        if (!pc_writesrc(merged_source,tstring)) {
+          pc_closesrc(fsrc);
+          error(101,merged_name);
+        }
+      }
       pc_closesrc(fsrc);
+      if (!pc_writesrc(merged_source,(unsigned char*)"\n"))
+        error(101,merged_name);
     } /* for */
-    pc_closesrc(ftmp);
-    strcpy(inpfname,tname);
-    free(tname);
+    pc_closesrc(merged_source);
+    merged_source=NULL;
+    strlcpy(inpfname,merged_name,_MAX_PATH);
   } else {
     strcpy(inpfname,get_sourcefile(0));
   } /* if */
@@ -641,26 +671,12 @@ int pc_compile(int argc, char *argv[])
       fline++;                  /* keep line number up to date */
   skipinput=fline;
   sc_status=statFIRST;
-  /* write starting options (from the command line or the configuration file) */
-  if (sc_listing) {
-    char string[150];
-    sprintf(string,"#pragma ctrlchar 0x%02x\n"
-                   "#pragma pack %s\n"
-                   "#pragma semicolon %s\n"
-                   "#pragma tabsize %d\n",
-            sc_ctrlchar,
-            sc_packstr ? "true" : "false",
-            sc_needsemicolon ? "true" : "false",
-            sc_tabsize);
-    pc_writeasm(outf,string);
-  } /* if */
-  setfiledirect(inpfname);
   /* do the first pass through the file (or possibly two or more "first passes") */
   sc_parsenum=0;
   inpfmark=pc_getpossrc(inpf_org);
   do {
     /* reset "defined" flag of all functions and global variables */
-    reduce_referrers(&glbtab);
+    reduce_referrers(global_symbol_table());
     delete_symbols(&glbtab,0,TRUE,FALSE);
     delete_heaplisttable();
     #if !defined NO_DEFINE
@@ -696,7 +712,7 @@ int pc_compile(int argc, char *argv[])
 
   /* second (or third) pass */
   sc_status=statWRITE;                  /* set, to enable warnings */
-  state_conflict(&glbtab);
+  state_conflict(global_symbol_table());
 
   /* write a report, if requested */
   #if !defined SC_LIGHT
@@ -705,7 +721,7 @@ int pc_compile(int argc, char *argv[])
       if (strlen(reportname)>0)
         frep=fopen(reportname,"wb");    /* avoid translation of \n to \r\n in DOS/Windows */
       if (frep!=NULL) {
-        make_report(&glbtab,frep,get_sourcefile(0));
+        make_report(global_symbol_table(),frep,get_sourcefile(0));
         if (strlen(reportname)>0)
           fclose(frep);
       } /* if */
@@ -715,9 +731,6 @@ int pc_compile(int argc, char *argv[])
       } /* if */
     } /* if */
   #endif
-  if (sc_listing)
-    goto cleanup;
-
   /* ??? for re-parsing the listing file instead of the original source
    * file (and doing preprocessing twice):
    * - close input file, close listing file
@@ -726,7 +739,7 @@ int pc_compile(int argc, char *argv[])
    */
 
   /* reset "defined" flag of all functions and global variables */
-  reduce_referrers(&glbtab);
+  reduce_referrers(global_symbol_table());
   delete_symbols(&glbtab,0,TRUE,FALSE);
   #if !defined NO_DEFINE
     delete_substtable();
@@ -743,9 +756,24 @@ int pc_compile(int argc, char *argv[])
   pc_resetsrc(inpf,inpfmark);   /* reset file position */
   fline=skipinput;              /* reset line number */
   lexinit();                    /* clear internal flags of lex() */
-  sc_status=statWRITE;          /* allow to write --this variable was reset by resetglobals() */
+  sc_status=sc_listing ? statSECOND : statWRITE;
+  /* write starting options (from the command line or the configuration file) */
+  if (sc_listing) {
+    char string[150];
+    sprintf(string,"#pragma ctrlchar 0x%02x\n"
+                   "#pragma pack %s\n"
+                   "#pragma semicolon %s\n"
+                   "#pragma tabsize %d\n",
+            sc_ctrlchar,
+            sc_packstr ? "true" : "false",
+            sc_needsemicolon ? "true" : "false",
+            sc_tabsize);
+    pc_writeasm(outf,string);
+  } /* if */
+  setfiledirect(inpfname);
   setstringconstants();
-  writeleader(&glbtab);
+  if (!sc_listing)
+    writeleader(global_symbol_table());
   setfileconst(inpfname);
   insert_dbgfile(inpfname);
   if (strlen(incfname)>0) {
@@ -756,10 +784,12 @@ int pc_compile(int argc, char *argv[])
   } /* if */
   preprocess();                         /* fetch first line */
   parse();                              /* process all input */
+  if (sc_listing)
+    goto cleanup;
   /* inpf is already closed when readline() attempts to pop of a file */
   writetrailer();                       /* write remaining stuff */
 
-  entry=testsymbols(&glbtab,0,TRUE,FALSE);  /* test for unused or undefined
+  entry=testsymbols(global_symbol_table(),0,TRUE,FALSE);  /* test for unused or undefined
                                              * functions and variables */
   if (!entry)
     error(13);                  /* no entry point (no public functions) */
@@ -796,7 +826,7 @@ cleanup:
   #if !defined SC_LIGHT
     if (errnum==0 && jmpcode==0 && strlen(errfname)==0) {
       int recursion;
-      long stacksize=max_stacksize(&glbtab,&recursion);
+      long stacksize=max_stacksize(global_symbol_table(),&recursion);
       int flag_exceed=0;
       if (pc_amxlimit>0) {
         long totalsize=hdrsize+code_idx;
@@ -829,13 +859,16 @@ cleanup:
   #if defined PC_TIMING
     pc_profile_report();
   #endif
-  if (inpfname!=NULL) {
-    if (get_sourcefile(1)!=NULL)
-      remove(inpfname);         /* the "input file" was in fact a temporary file */
-    free(inpfname);
-  } /* if */
+  if (merged_source!=NULL)
+    pc_closesrc(merged_source);
+  if (merged_name!=NULL) {
+    remove(merged_name);
+    free(merged_name);
+  }
+  free(inpfname);
   if (litq!=NULL)
     free(litq);
+  clear_asm_index();
   stgbuffer_cleanup();
   clearstk();
   assert(jmpcode!=0 || loctab.next==NULL);/* on normal flow, local symbols
@@ -844,6 +877,8 @@ cleanup:
                                            * done (i.e. on a fatal error) */
   delete_symbols(&glbtab,0,TRUE,TRUE);
   line_sym=NULL;
+  clear_include_guards();
+  clear_include_cache();
   hashtable_term(&symbol_cache_ht);
   delete_consttable(&tagname_tab);
   delete_consttable(&libname_tab);
@@ -905,7 +940,7 @@ int pc_addtag(char *name)
 {
   cell val;
   constvalue *ptr;
-  int last,tag;
+  int tag;
 
   if (name==NULL) {
     /* no tagname was given, check for one */
@@ -916,20 +951,11 @@ int pc_addtag(char *name)
   } /* if */
 
   assert(strchr(name,':')==NULL); /* colon should already have been stripped */
-  last=0;
-  ptr=tagname_tab.first;
-  while (ptr!=NULL) {
-    tag=(int)(ptr->value & TAGMASK);
-    if (strcmp(name,ptr->name)==0)
-      return tag;       /* tagname is known, return its sequence number */
-    tag &= (int)~FIXEDTAG;
-    if (tag>last)
-      last=tag;
-    ptr=ptr->next;
-  } /* while */
+  ptr=find_constval(&tagname_tab,name,0);
+  if (ptr!=NULL)
+    return (int)(ptr->value & TAGMASK);
 
-  /* tagname currently unknown, add it */
-  tag=last+1;           /* guaranteed not to exist already */
+  tag=tag_max_id+1;
   if (isupper(*name))
     tag |= (int)FIXEDTAG;
   append_constval(&tagname_tab,name,(cell)tag,0);
@@ -938,6 +964,7 @@ int pc_addtag(char *name)
 
 static void resetglobals(void)
 {
+  clear_include_guards();
   /* reset the subset of global variables that is modified by the first pass */
   curfunc=NULL;         /* pointer to current function */
   lastst=0;             /* last executed statement type */
@@ -1137,6 +1164,7 @@ static void parseoptions(int argc,char **argv,char *oname,char *ename,char *pnam
         if (ptr[1]==':')
           dos_setdrive(toupper(*ptr)-'A'+1);    /* set active drive */
 #endif
+        clear_include_cache();
         if (chdir(ptr)==-1)
           ; /* silently ignore chdir() errors */
         break;
@@ -2158,7 +2186,7 @@ static void declglb(char *firstname,int firsttag,int fpublic,int fstatic,int fst
      */
     assert(sym==NULL
            || sym->states==NULL && sc_curstates==0
-           || sym->states!=NULL && sym->next!=NULL && sym->states->first->index==sc_curstates);
+           || sym->states!=NULL && sym->states->first!=NULL && sym->states->first->index==sc_curstates);
     /* a state variable may only have a single id in its list (so either this
      * variable has no states, or it has a single list)
      */
@@ -2213,7 +2241,7 @@ static void declglb(char *firstname,int firsttag,int fpublic,int fstatic,int fst
         memset(map,0,(glb_declared+7)/8);
         assert(fsa>=0);
         /* fill in all variables belonging to this automaton */
-        for (sweep=glbtab.next; sweep!=NULL; sweep=sweep->next) {
+        for (sweep=global_symbol_table()->next; sweep!=NULL; sweep=sweep->next) {
           if (sweep->parent!=NULL || sweep->states==NULL || sweep==sym)
             continue;   /* hierarchical type, or no states, or same as this variable */
           if (sweep->ident!=iVARIABLE && sweep->ident!=iARRAY)
@@ -2235,7 +2263,7 @@ static void declglb(char *firstname,int firsttag,int fpublic,int fstatic,int fst
           } /* while */
         } /* for */
         /* go over it again, clearing any ranges that have conflicts */
-        for (sweep=glbtab.next; sweep!=NULL; sweep=sweep->next) {
+        for (sweep=global_symbol_table()->next; sweep!=NULL; sweep=sweep->next) {
           if (sweep->parent!=NULL || sweep->states==NULL || sweep==sym)
             continue;   /* hierarchical type, or no states, or same as this variable */
           if (sweep->ident!=iVARIABLE && sweep->ident!=iARRAY)
@@ -2440,7 +2468,10 @@ static int declloc(int fstatic)
         int ctag = tag;         /* set to "tag" by default */
         int explicit_init=FALSE;/* is the variable explicitly initialized? */
         if (matchtoken('=')) {
+          sym->usage &= ~uDEFINE;   /* temporarily mark the variable as undefined to prevent
+                                     * possible self-assignment through its initialization expression */
           doexpr(FALSE,FALSE,FALSE,FALSE,&ctag,NULL,TRUE);
+          sym->usage |= uDEFINE;
           explicit_init=TRUE;
         } else {
           ldconst(0,sPRI);      /* uninitialized variable, set to zero */
@@ -2580,17 +2611,21 @@ static void initials(int ident,int tag,cell *size,int dim[],int numdim,
   cell tablesize;
   int curlit=litidx;
   int err=0;
+  int i;
 
   if (!matchtoken('=')) {
     assert(ident!=iARRAY || numdim>0);
-    if (ident==iARRAY && dim[numdim-1]==0) {
-      /* declared as "myvar[];" which is senseless (note: this *does* make
-       * sense in the case of a iREFARRAY, which is a function parameter)
-       */
-      error(9);         /* array has zero length -> invalid size */
-    } /* if */
     if (ident==iARRAY) {
       assert(numdim>0 && numdim<=sDIMEN_MAX);
+      for (i=0; i<numdim; i++) {
+        if (dim[i]==0) {
+          /* declared like "myvar[];" which is senseless (note: this *does* make
+           * sense in the case of a iREFARRAY, which is a function parameter)
+           */
+          error(9); /* array has zero length -> invalid size */
+          return;
+        } /* if */
+      } /* for */
       *size=calc_arraysize(dim,numdim,0);
       if (*size==(cell)CELL_MAX) {
         error(9);       /* array is too big -> invalid size */
@@ -3044,7 +3079,7 @@ static void decl_enum(int vclass,int fstatic)
       lexpush();
       break;
     } /* if */
-    idxtag=pc_addtag(NULL);             /* optional explicit item tag */
+    idxtag=(enumname[0]=='\0') ? tag : pc_addtag(NULL); /* optional explicit item tag */
     if (needtoken(tSYMBOL)) {           /* read in (new) token */
       tokeninfo(&val,&str);             /* get the information */
       strcpy(constname,str);            /* save symbol name */
@@ -3945,6 +3980,20 @@ static int newfunc(char *firstname,int firsttag,int fpublic,int fstatic,int stoc
     dumplits();                 /* dump literal strings */
     litidx=0;
   } /* if */
+  if (sym->states!=NULL) {
+    arginfo *arg;
+    for (arg=sym->dim.arglist; arg->ident!=0; arg++) {
+      if (arg->ident==iREFARRAY) {
+        symbol *local=findloc(arg->name);
+        symbol *part;
+        if (local==NULL)
+          continue;
+        for (part=local; part!=NULL && (arg->usage & uWRITTEN)==0; part=finddepend(part))
+          arg->usage|=part->usage & uWRITTEN;
+        local->usage|=arg->usage & uWRITTEN;
+      }
+    }
+  }
   testsymbols(&loctab,0,TRUE,TRUE);     /* test for unused arguments and labels */
   delete_symbols(&loctab,0,TRUE,TRUE);  /* clear local variables queue */
   assert(loctab.next==NULL);
@@ -4089,7 +4138,9 @@ static int declargs(symbol *sym,int chkshadow)
          *   base + 3*sizeof(cell)  == first argument of the function
          * So the offset of each argument is "(argcnt+3) * sizeof(cell)".
          */
-        doarg(name,ident,(argcnt+3)*sizeof(cell),tags,numtags,fpublic,fconst,chkshadow,&arg);
+        doarg(name,ident,(argcnt+3)*sizeof(cell),tags,numtags,fpublic,fconst,
+              argcnt<oldargcnt && (sym->dim.arglist[argcnt].usage & uWRITTEN)!=0,
+              chkshadow,&arg);
         if (fpublic && arg.hasdefault)
           error(59,name);       /* arguments of a public function may not have a default value */
         if ((sym->usage & uPROTOTYPED)==0) {
@@ -4204,7 +4255,7 @@ static int declargs(symbol *sym,int chkshadow)
  *  The arguments themselves are never public.
  */
 static void doarg(char *name,int ident,int offset,int tags[],int numtags,
-                  int fpublic,int fconst,int chkshadow,arginfo *arg)
+                  int fpublic,int fconst,int written,int chkshadow,arginfo *arg)
 {
   symbol *argsym;
   constvalue_root *enumroot;
@@ -4297,7 +4348,7 @@ static void doarg(char *name,int ident,int offset,int tags[],int numtags,
     } /* if */
   } /* if */
   arg->ident=(char)ident;
-  arg->usage=(char)(fconst ? uCONST : 0);
+  arg->usage=(char)((fconst ? uCONST : 0) | (written ? uWRITTEN : 0));
   arg->numtags=numtags;
   arg->tags=(int*)malloc(numtags*sizeof tags[0]);
   if (arg->tags==NULL)
@@ -4313,8 +4364,12 @@ static void doarg(char *name,int ident,int offset,int tags[],int numtags,
     assert(numtags>0);
     argsym=addvariable(name,offset,ident,sLOCAL,tags[0],
                        arg->dim,arg->numdim,arg->idxtag,0);
-    if (fpublic)
+    if (fpublic) {
       argsym->usage|=uREAD;     /* arguments of public functions are always "used" */
+      if(argsym->ident==iREFARRAY || argsym->ident==iREFERENCE)
+        argsym->usage|=uWRITTEN;
+    }
+
     if (fconst)
       argsym->usage|=uCONST;
   } /* if */
@@ -4846,6 +4901,8 @@ static void reduce_referrers(symbol *root)
       symbol *ref=tab[edge->symbol_index];
       if (ref->refer[edge->refer_index]==sym) {
         ref->refer[edge->refer_index]=NULL;
+        if (edge->refer_index<ref->first_free_referrer)
+          ref->first_free_referrer=edge->refer_index;
         ref->rr_cnt--;
         if (ref->rr_cnt==0 && ref->ident==iFUNCTN && (ref->usage & uNATIVE)==0
             && (ref->usage & uPUBLIC)==0 && strcmp(ref->name,uMAINFUNC)!=0 && strcmp(ref->name,uENTRYFUNC)!=0)
@@ -4996,7 +5053,7 @@ static int testsymbols(symbol *root,int level,int testlabs,int testconst)
     case iLABEL:
       if (testlabs) {
         if ((sym->usage & uDEFINE)==0) {
-          error(19,sym->name);      /* not a label: ... */
+          error_suggest(19,sym->name,NULL,estSYMBOL,esfLABEL);      /* not a label: ... */
         } else if ((sym->usage & uREAD)==0) {
           errorset(sSETPOS,sym->lnumber);
           error(203,sym->name);     /* symbol isn't used: ... */
@@ -5036,9 +5093,20 @@ static int testsymbols(symbol *root,int level,int testlabs,int testconst)
         error(204,sym->name);       /* value assigned to symbol is never used */
         errorset(sSETPOS,-1);
       } else if ((sym->usage & (uWRITTEN | uPUBLIC | uCONST))==0 && sym->ident==iREFARRAY) {
-        errorset(sSETPOS,sym->lnumber);
-        error(214,sym->name);       /* make array argument "const" */
-        errorset(sSETPOS,-1);
+        int warn = 1;
+        symbol* depend = finddepend(sym);
+        while (depend != NULL) {
+          if ((depend->usage & (uWRITTEN | uPUBLIC | uCONST)) != 0) {
+            warn = 0;
+            break;
+          }
+          depend = finddepend(depend);
+        } /* while */
+        if (warn) {
+          errorset(sSETPOS, sym->lnumber);
+          error(214, sym->name);       /* make array argument "const" */
+          errorset(sSETPOS, -1);
+        } /* if */
       } /* if */
       /* also mark the variable (local or global) to the debug information */
       if ((sym->usage & (uWRITTEN | uREAD))!=0 && (sym->usage & uNATIVE)==0)
@@ -5078,13 +5146,22 @@ static void destructsymbols(symbol *root,int level)
   int savepri=FALSE;
   symbol *sym=root->next;
   while (sym!=NULL && sym->compound>=level) {
-    if ((sym->ident==iVARIABLE || sym->ident==iARRAY) && !(sym->vclass==sSTATIC && sym->fnumber==-1)) {
+    if ((sym->ident==iVARIABLE || sym->ident==iARRAY) && (sym->usage & uNODESTRUCT)==0
+        && !(sym->vclass==sSTATIC && sym->fnumber==-1)) {
       char symbolname[16];
       symbol *opsym;
       cell elements;
       /* check that the '~' operator is defined for this tag */
       operator_symname(symbolname,"~",sym->tag,0,1,0);
       if ((opsym=findglb(symbolname,sGLOBAL))!=NULL) {
+        if ((opsym->usage & uMISSING)!=0 || (opsym->usage & uPROTOTYPED)==0) {
+          char symname[2*sNAMEMAX+16];  /* allow space for user defined operators */
+          funcdisplayname(symname,opsym->name);
+          if ((opsym->usage & uMISSING)!=0)
+            error(4,symname);           /* function not defined */
+          if ((opsym->usage & uPROTOTYPED)==0)
+            error(71,symname);          /* operator must be declared before use */
+        } /* if */
         /* save PRI, in case of a return statment */
         if (!savepri) {
           pushreg(sPRI);        /* right-hand operand is in PRI */
@@ -5153,6 +5230,50 @@ static constvalue *insert_constval(constvalue *prev,constvalue *next,
   return cur;
 }
 
+static constvalue **find_tag_slot(constvalue **slots,size_t capacity,const char *name)
+{
+  const unsigned char *p=(const unsigned char*)name;
+  uint32_t hash=UINT32_C(2166136261);
+  size_t slot;
+
+  while (*p!='\0')
+    hash=(hash^*p++)*UINT32_C(16777619);
+  slot=hash & (capacity-1);
+  while (slots[slot]!=NULL && strcmp(slots[slot]->name,name)!=0)
+    slot=(slot+1) & (capacity-1);
+  return &slots[slot];
+}
+
+static void index_tag(constvalue *tag)
+{
+  int id=(int)(tag->value & TAGMASK) & (int)~FIXEDTAG;
+  if (tag_max_id<id)
+    tag_max_id=id;
+  tag_count++;
+  if (tag_count<32)
+    return;
+
+  if (tag_count>tag_index_capacity/2) {
+    size_t capacity=tag_index_capacity ? tag_index_capacity*2 : 64;
+    constvalue **slots=(constvalue**)calloc(capacity,sizeof(*slots));
+    constvalue *ptr;
+    if (slots==NULL)
+      error(103);
+    for (ptr=tagname_tab.first; ptr!=NULL; ptr=ptr->next) {
+      constvalue **slot=find_tag_slot(slots,capacity,ptr->name);
+      if (*slot==NULL)
+        *slot=ptr;
+    }
+    free(tag_index);
+    tag_index=slots;
+    tag_index_capacity=capacity;
+  } else {
+    constvalue **slot=find_tag_slot(tag_index,tag_index_capacity,tag->name);
+    if (*slot==NULL)
+      *slot=tag;
+  }
+}
+
 SC_FUNC constvalue *append_constval(constvalue_root *table,const char *name,
                                     cell val,int index)
 {
@@ -5165,12 +5286,17 @@ SC_FUNC constvalue *append_constval(constvalue_root *table,const char *name,
     table->first=newvalue;
   } /* if */
   table->last=newvalue;
+  if (table==&tagname_tab)
+    index_tag(newvalue);
   return newvalue;
 }
 
 SC_FUNC constvalue *find_constval(constvalue_root *table,char *name,int index)
 {
-  constvalue *ptr = table->first;
+  constvalue *ptr=table->first;
+
+  if (table==&tagname_tab && index==0 && tag_index!=NULL)
+    return *find_tag_slot(tag_index,tag_index_capacity,name);
 
   while (ptr!=NULL) {
     if (strcmp(name,ptr->name)==0 && ptr->index==index)
@@ -5220,6 +5346,12 @@ SC_FUNC void delete_consttable(constvalue_root *table)
 {
   constvalue *cur=table->first, *next;
 
+  if (table==&tagname_tab) {
+    free(tag_index);
+    tag_index=NULL;
+    tag_count=tag_index_capacity=0;
+    tag_max_id=0;
+  }
   while (cur!=NULL) {
     next=cur->next;
     free(cur);
@@ -5894,16 +6026,64 @@ static int dofor(void)
  *   param = table offset (code segment)
  *
  */
+typedef struct {
+  cell value;
+  int label;
+} switch_case;
+
+static void add_switch_case(switch_case **cases,switch_case *local_cases,
+                            size_t *capacity,int count,cell value,int label)
+{
+  size_t pos=count;
+  switch_case *items=*cases;
+
+  /* Increasing labels append directly. For out-of-order values, find the
+   * insertion point and detect duplicates while still at the source label. */
+  if (pos>0 && items[pos-1].value>=value) {
+    size_t first=0,last=pos;
+    while (first<last) {
+      size_t middle=first+(last-first)/2;
+      if (items[middle].value<value)
+        first=middle+1;
+      else
+        last=middle;
+    }
+    pos=first;
+    if (items[pos].value==value)
+      error(40,value);
+  }
+
+  if ((size_t)count==*capacity) {
+    if (*capacity>(size_t)-1/2/sizeof(*items))
+      error(103);
+    *capacity*=2;
+    if (items==local_cases) {
+      items=(switch_case*)malloc(*capacity*sizeof(*items));
+      if (items!=NULL)
+        memcpy(items,local_cases,count*sizeof(*items));
+    } else {
+      items=(switch_case*)realloc(items,*capacity*sizeof(*items));
+    }
+    if (items==NULL)
+      error(103);
+    *cases=items;
+  }
+  if (pos<(size_t)count)
+    memmove(items+pos+1,items+pos,(count-pos)*sizeof(*items));
+  items[pos].value=value;
+  items[pos].label=label;
+}
+
 static void doswitch(void)
 {
   int lbl_table,lbl_exit,lbl_case;
-  int swdefault,casecount;
+  int swdefault,casecount,i;
   int tok,endtok;
   cell val;
   char *str;
-  constvalue_root caselist = { NULL, NULL};   /* case list starts empty */
-  constvalue *cse,*csp,*newval;
-  char labelname[sNAMEMAX+1];
+  switch_case local_cases[32],*cases=local_cases;
+  size_t case_capacity=sizeof(local_cases)/sizeof(local_cases[0]);
+  char labelname[2*sizeof(ucell)+1];
 
   endtok= matchtoken('(') ? ')' : tDO;
   doexpr(TRUE,FALSE,FALSE,FALSE,NULL,NULL,TRUE);/* evaluate switch expression */
@@ -5934,8 +6114,6 @@ static void doswitch(void)
       PUSHSTK_I(sc_allowtags);
       sc_allowtags=FALSE; /* do not allow tagnames here */
       do {
-        casecount++;
-
         /* ??? enforce/document that, in a switch, a statement cannot start
          *     with a label. Then, you can search for:
          *     * the first semicolon (marks the end of a statement)
@@ -5946,45 +6124,17 @@ static void doswitch(void)
          */
 
         constexpr(&val,NULL,NULL);
-        /* Search the insertion point (the table is kept in sorted order, so
-         * that advanced abstract machines can sift the case table with a
-         * binary search). Check for duplicate case values at the same time.
-         */
-        for (csp=NULL, cse=caselist.first;
-             cse!=NULL && cse->value<val;
-             csp=cse, cse=cse->next)
-          /* nothing */;
-        if (cse!=NULL && cse->value==val)
-          error(40,val);                /* duplicate "case" label */
-        /* Since the label is stored as a string in the "constvalue", the
-         * size of an identifier must be at least 8, as there are 8
-         * hexadecimal digits in a 32-bit number.
-         */
-        #if sNAMEMAX < 8
-          #error Length of identifier (sNAMEMAX) too small.
-        #endif
-        assert(csp==NULL || csp->next==cse);
-        newval=insert_constval(csp,cse,itoh(lbl_case),val,0);
-        if (csp==NULL)
-          caselist.first=newval;
+        add_switch_case(&cases,local_cases,&case_capacity,casecount++,val,lbl_case);
         if (matchtoken(tDBLDOT)) {
           cell end;
           constexpr(&end,NULL,NULL);
           if (end<=val)
             error(50);                  /* invalid range */
-          while (++val<=end) {
-            casecount++;
-            /* find the new insertion point */
-            for (csp=NULL, cse=caselist.first;
-                 cse!=NULL && cse->value<val;
-                 csp=cse, cse=cse->next)
-              /* nothing */;
-            if (cse!=NULL && cse->value==val)
-              error(40,val);            /* duplicate "case" label */
-            assert(csp==NULL || csp->next==cse);
-            insert_constval(csp,cse,itoh(lbl_case),val,0);
-          } /* if */
-        } /* if */
+          while (val<end) {
+            val++;
+            add_switch_case(&cases,local_cases,&case_capacity,casecount++,val,lbl_case);
+          }
+        }
       } while (matchtoken(','));
       needtoken(':');                   /* ':' ends the case */
       sc_allowtags=(short)POPSTK_I();   /* reset */
@@ -6015,30 +6165,18 @@ static void doswitch(void)
     } /* switch */
   } while (tok!=endtok);
 
-  #if !defined NDEBUG
-    /* verify that the case table is sorted (unfortunatly, duplicates can
-     * occur; there really shouldn't be duplicate cases, but the compiler
-     * may not crash or drop into an assertion for a user error). */
-    for (cse=caselist.first; cse!=NULL && cse->next!=NULL; cse=cse->next)
-      assert(cse->value <= cse->next->value);
-  #endif
-  /* generate the table here, before lbl_exit (general jump target) */
+  /* Generate the sorted table before the general exit label. */
   setlabel(lbl_table);
-  assert(swdefault==FALSE || swdefault==TRUE);
-  if (swdefault==FALSE) {
-    /* store lbl_exit as the "none-matched" label in the switch table */
-    strcpy(labelname,itoh(lbl_exit));
-  } else {
-    /* lbl_case holds the label of the "default" clause */
-    strcpy(labelname,itoh(lbl_case));
-  } /* if */
+  strcpy(labelname,itoh(swdefault ? lbl_case : lbl_exit));
   ffcase(casecount,labelname,TRUE);
-  /* generate the rest of the table */
-  for (cse=caselist.first; cse!=NULL; cse=cse->next)
-    ffcase(cse->value,cse->name,FALSE);
+  for (i=0; i<casecount; i++) {
+    strcpy(labelname,itoh(cases[i].label));
+    ffcase(cases[i].value,labelname,FALSE);
+  }
 
   setlabel(lbl_exit);
-  delete_consttable(&caselist); /* clear list of case labels */
+  if (cases!=local_cases)
+    free(cases);
 }
 
 static void doassert(void)
@@ -6081,7 +6219,7 @@ static void dogoto(void)
     //     sym->compound (nesting level of the label) against nestlevel;
     //     if sym->compound < nestlevel, call the destructor operator
   } else {
-    error(20,st);       /* illegal symbol name */
+    error_suggest(20,st,NULL,estSYMBOL,esfLABEL);
   } /* if */
   needtoken(tTERM);
 }
@@ -6121,7 +6259,7 @@ static symbol *fetchlab(char *name)
   sym=findloc(name);            /* labels are local in scope */
   if (sym) {
     if (sym->ident!=iLABEL)
-      error(19,sym->name);      /* not a label: ... */
+      error_suggest(19,sym->name,NULL,estSYMBOL,esfLABEL);      /* not a label: ... */
   } else {
     sym=addsym(name,getlabel(),iLABEL,sLOCAL,0,0);
     assert(sym!=NULL);          /* fatal error 103 must be given on error */
@@ -6185,15 +6323,16 @@ fetchtok:
       p->type=eotLABEL;
       p->value.ucell=(ucell)sym->addr;
     } else if (sym->ident==iFUNCTN || sym->ident==iREFFUNC) {
-      markusage(sym,uREAD);
       if (negate)
         goto invalid_token_neg;
       if (!allow_nonint) {
         tok=(sym->usage & uNATIVE) ? teNATIVE : teFUNCTN;
         goto invalid_token;
       } /* if */
-      if ((sym->usage & uNATIVE)!=0 && (sym->usage & uREAD)==0 && sym->addr>=0)
+      if (sc_status==statWRITE && (sym->usage & uNATIVE)!=0
+          && (sym->usage & uREAD)==0 && sym->addr>=0)
         sym->addr=ntv_funcid++;
+      markusage(sym,uREAD);
       p->type=eotFUNCTION;
       p->value.string=str;
     } else {
@@ -6440,7 +6579,6 @@ static void SC_FASTCALL emit_param_function(emit_outval *p,int isnative)
       error(17,str);    /* undefined symbol */
       return;
     } /* if */
-    markusage(sym,uREAD);
     if (sym->ident==iFUNCTN || sym->ident==iREFFUNC) {
       if (!!(sym->usage & uNATIVE)==isnative)
         break;
@@ -6455,13 +6593,14 @@ static void SC_FASTCALL emit_param_function(emit_outval *p,int isnative)
   } /* switch */
 
   if (isnative!=FALSE) {
-    if ((sym->usage & uREAD)==0 && sym->addr>=0)
+    if (sc_status==statWRITE && (sym->usage & uREAD)==0 && sym->addr>=0)
       sym->addr=ntv_funcid++;
     p->value.ucell=(ucell)sym->addr;
   } else {
     p->type=eotFUNCTION;
     p->value.string=str;
   } /* if */
+  markusage(sym,uREAD);
 }
 
 static void SC_FASTCALL emit_noop(char *name)
@@ -6994,12 +7133,12 @@ SC_FUNC void emit_parse_line(void)
      * and copy the instruction name
      */
     lptr-=len;
-    for (i=0; i<sizeof(name) && (isalnum(*lptr) || *lptr=='.'); ++i,++lptr)
+    for (i=0; i<sizeof(name)-1 && (isalnum(*lptr) || *lptr=='.'); ++i,++lptr)
       name[i]=(char)tolower(*lptr);
     name[i]='\0';
 
     /* find the corresponding argument handler and call it */
-    i=emit_findopcode(name,strlen(name));
+    i=emit_findopcode(name,i);
     if (emit_opcodelist[i].name==NULL && *name!='\0')
       error(104,name); /* invalid assembler instruction */
     emit_opcodelist[i].func(name);

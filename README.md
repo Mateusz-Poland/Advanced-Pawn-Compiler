@@ -1,8 +1,10 @@
 # Advanced Pawn Compiler (APC)
 
+[Assembler and include performance report](ASSEMBLE.ru.md)
+
 **Advanced Pawn Compiler (APC)** is a performance-oriented fork of the Pawn compiler, intended for large Pawn codebases, including SA-MP and open.mp projects.
 
-> **Development status:** this repository snapshot is a development build for the 3.11.0 line, not a final stable release. Review the known limitations and run your own compatibility tests before using it in production.
+> The compatibility update fixes qualified include paths in -Z and incorporates relevant Pawn 3.10.9/3.10.10 changes. See [UPDATE.ru.md](UPDATE.ru.md) for the changes, limitations and benchmarks.
 
 ## What is included
 
@@ -24,7 +26,11 @@ The current source tree contains several performance-oriented changes, including
 - **Opcode handling:** opcode lookup and reuse avoid repeated string-based searches.
 - **AMX output:** output is buffered, including block writes for repeated cells.
 - **I/O:** larger buffers are used for source and temporary-file operations.
-- **Symbol lookup:** global symbols and repeated referrer lookups use hash-based indexes.
+- **Symbols:** global lookup uses a hash index. New global symbols are linked in constant time and merged in order before list traversal.
+- **Preprocessing:** a hash table indexes macro identifier prefixes independently of their expansion patterns.
+- **Tags:** large tag tables have a name index and cache the highest assigned ID.
+- **References:** insertion tracks the first free slot to avoid rescanning referrer arrays.
+- **Switch tables:** a contiguous buffer stores sorted case values and integer labels, with direct append for increasing values.
 
 These describe implementation changes in the source. Actual speedups depend on the project, compiler flags, platform and filesystem; use the benchmark fixtures to measure your own workloads.
 
